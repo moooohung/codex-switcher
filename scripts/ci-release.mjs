@@ -11,6 +11,17 @@ const SHA = /^[a-f0-9]{40}$/;
 const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const PACKAGE = /(?:\.dmg|\.msi|\.exe|\.deb|\.rpm|\.AppImage|\.zip|\.tar\.gz)$/i;
 
+function readRegularFile(file) {
+  // Validate and read one open descriptor, rather than checking a pathname
+  // and opening it again. Publication runs on Linux, where O_NOFOLLOW also
+  // rejects symlinks. The descriptor check remains portable to Windows.
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    assert(fs.fstatSync(fd).isFile(), "Release assets must be regular files");
+    return fs.readFileSync(fd);
+  } finally { fs.closeSync(fd); }
+}
+
 export function releasePlan({ repository, eventName, event, sha, version, requestedTag = "", workflowSha = sha }) {
   assert.equal(repository, REPOSITORY, "Release repository is not trusted");
   assert.match(version, VERSION, "Source must have a stable package version");
@@ -62,10 +73,10 @@ export function collectReleaseFiles(root, plan) {
   const declared = new Set();
   for (const name of files) {
     const file = path.join(root, name);
-    assert(fs.lstatSync(file).isFile(), "Release assets must be regular files");
+    const bytes = readRegularFile(file);
     assert(!/[\r\n\0]/.test(name));
     if (name.startsWith("provenance-") && name.endsWith(".json")) {
-      const manifest = JSON.parse(fs.readFileSync(file, "utf8"));
+      const manifest = JSON.parse(bytes.toString("utf8"));
       assert(TARGETS.includes(manifest.target));
       assert.equal(name, `provenance-${manifest.target}.json`);
       assert.equal(manifest.sha, plan.sha);
@@ -138,12 +149,11 @@ function main(command) {
     const files = [];
     for (const source of paths) {
       if (!PACKAGE.test(source)) continue;
-      assert(fs.lstatSync(source).isFile());
+      const bytes = readRegularFile(source);
       const name = `${target}--${path.basename(source)}`;
       assert(!/[\r\n\0]/.test(name));
       const destination = path.join("release-assets", name);
-      assert(!fs.existsSync(destination), "Release filename collision");
-      fs.copyFileSync(source, destination);
+      fs.writeFileSync(destination, bytes, { flag: "wx" });
       files.push(name);
     }
     assert(files.length > 0, "Tauri produced no distributable packages");
@@ -158,7 +168,7 @@ function main(command) {
     const files = collectReleaseFiles("release-assets", plan);
     // Verify provenance before publication, including the exact source digest.
     for (const file of files) run("gh", ["attestation", "verify", file, "--repo", REPOSITORY, "--source-digest", plan.sha, "--signer-workflow", `${REPOSITORY}/.github/workflows/build.yml`, "--deny-self-hosted-runners"]);
-    const digests = new Map(files.map((file) => [path.basename(file), createHash("sha256").update(fs.readFileSync(file)).digest("hex")]));
+    const digests = new Map(files.map((file) => [path.basename(file), createHash("sha256").update(readRegularFile(file)).digest("hex")]));
     const checksumFile = "release-assets/checksums.txt";
     fs.writeFileSync(checksumFile, [...digests].map(([name, digest]) => `${digest}  ${name}\n`).join(""));
     digests.set("checksums.txt", createHash("sha256").update(fs.readFileSync(checksumFile)).digest("hex"));

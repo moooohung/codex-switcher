@@ -394,6 +394,11 @@ mod tests {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&dir).unwrap();
+            // macOS exposes its temporary directory through the /var symlink.
+            // Fixtures must use an ordinary path to exercise the production
+            // guard without relaxing its rejection of symlink ancestors.
+            #[cfg(unix)]
+            let dir = fs::canonicalize(dir).unwrap();
             let path = dir.join(format!("{SESSION}.jsonl"));
             Self { dir, path }
         }

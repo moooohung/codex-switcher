@@ -416,7 +416,14 @@ mod tests {
         let session = Session::launch(&cmd, &root).await.unwrap();
         let observed: Value = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
         assert_eq!(observed["console"], true);
-        assert_eq!(observed["cwd"], root.to_string_lossy().as_ref());
+        // Hosted Windows runners may report TEMP using an 8.3 alias while
+        // pwsh resolves the long name. Compare directory identity, not spelling.
+        assert_eq!(
+            Path::new(observed["cwd"].as_str().unwrap())
+                .canonicalize()
+                .unwrap(),
+            root.canonicalize().unwrap()
+        );
         assert_eq!(observed["marker"], "spaces 한글 ' \" $()");
         assert_eq!(observed["args"][1], "--exact");
         assert_eq!(

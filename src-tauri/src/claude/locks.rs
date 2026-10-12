@@ -604,7 +604,10 @@ mod tests {
         old.file
             .set_modified(SystemTime::now() - Duration::from_secs(20))
             .unwrap();
-        let guard = ConfigGuard::acquire_with_timeout(&config, timing().timeout).unwrap();
+        // The public policy retries every 100ms; 180ms is too tight on a
+        // contended hosted runner. Preserve its real stale threshold while
+        // allowing multiple retry intervals for successful takeover.
+        let guard = ConfigGuard::acquire_with_timeout(&config, Duration::from_secs(2)).unwrap();
         assert_ne!(old.identity, guard._lock.directory.identity);
         drop(guard);
         assert!(!path.exists());

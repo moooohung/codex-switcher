@@ -65,6 +65,14 @@ test("publication requires complete platform manifests matching the same source 
     fs.writeFileSync(extra, "unlisted package");
     assert.throws(() => collectReleaseFiles(root, plan), /not declared/);
     fs.unlinkSync(extra);
+    fs.mkdirSync(extra);
+    assert.throws(() => collectReleaseFiles(root, plan), /regular files/);
+    fs.rmdirSync(extra);
+    if (process.platform !== "win32") {
+      fs.symlinkSync(path.join(root, `${TARGETS[0]}--fixture.zip`), extra);
+      assert.throws(() => collectReleaseFiles(root, plan), /ELOOP/);
+      fs.unlinkSync(extra);
+    }
     const missingManifest = path.join(root, `provenance-${TARGETS[3]}.json`);
     const savedManifest = fs.readFileSync(missingManifest);
     fs.unlinkSync(missingManifest);

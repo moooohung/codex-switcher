@@ -715,6 +715,8 @@ mod tests {
     fn temp() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("cache-resume-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&dir).unwrap();
+        #[cfg(unix)]
+        let dir = fs::canonicalize(dir).unwrap();
         dir
     }
     fn native(dir: &Path, model: &str) -> PathBuf {
