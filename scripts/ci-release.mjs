@@ -88,6 +88,20 @@ export function versionEdits(root, version, runNumber) {
   return edits;
 }
 
+// GitHub may rename unsafe upload names; choose names before provenance and
+// attestation are generated instead of trusting a server-side rename mapping.
+// https://docs.github.com/en/rest/releases/assets#upload-a-release-asset
+export function uploadNames(names) {
+  const normalized = names.map((name) => {
+    assert.equal(path.basename(name), name, "Upload name must be a basename");
+    const safe = name.replace(/ /g, "-");
+    assert.match(safe, /^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$/, "Unsafe upload filename");
+    return safe;
+  });
+  assert.equal(new Set(normalized.map((name) => name.toLowerCase())).size, normalized.length, "Upload filename collision");
+  return normalized;
+}
+
 export function collectReleaseFiles(root, plan) {
   const files = fs.readdirSync(root).filter((name) => name !== "checksums.txt").sort();
   const found = new Set();
@@ -163,6 +177,8 @@ export function publishRelease({ repository, sha, tag, version, prerelease, root
   requireCI(sha, execute);
   checkTag(plan, execute);
   const files = collectReleaseFiles(path.join(root, "release-assets"), plan);
+  assert.deepEqual(uploadNames(files.map((file) => path.basename(file))), files.map((file) => path.basename(file)),
+    "Release filenames must be normalized before attestation");
   // Verify provenance before publication, including the exact source digest.
   for (const file of files) execute("gh", ["attestation", "verify", file, "--repo", REPOSITORY, "--source-digest", sha, "--signer-workflow", `${REPOSITORY}/.github/workflows/build.yml`, "--deny-self-hosted-runners"]);
   const digests = new Map(files.map((file) => [path.basename(file), createHash("sha256").update(readRegularFile(file)).digest("hex")]));
@@ -198,7 +214,10 @@ export function publishRelease({ repository, sha, tag, version, prerelease, root
   assert.equal(release.draft, true, "Release was published before asset verification");
   assert.equal(release.assets.length, digests.size, "Unexpected or missing published assets");
   assert.equal(new Set(release.assets.map((asset) => asset.name)).size, digests.size, "Duplicate uploaded asset names");
-  for (const asset of release.assets) assert.equal(asset.digest, `sha256:${digests.get(asset.name)}`, "Uploaded asset digest mismatch");
+  for (const asset of release.assets) {
+    assert(digests.has(asset.name), "Unexpected uploaded asset name");
+    assert.equal(asset.digest, `sha256:${digests.get(asset.name)}`, "Uploaded asset digest mismatch");
+  }
   checkTag(plan, execute);
   execute("gh", ["release", "edit", tag, "--repo", REPOSITORY, "--draft=false", `--prerelease=${prerelease}`, `--latest=${!prerelease}`]);
   return releaseId;
@@ -228,10 +247,11 @@ function main(command) {
     assert(Array.isArray(paths));
     fs.mkdirSync("release-assets", { recursive: true });
     const files = [];
-    for (const source of paths) {
-      if (!PACKAGE.test(source)) continue;
+    const packages = paths.filter((source) => PACKAGE.test(source));
+    const names = uploadNames(packages.map((source) => `${target}--${path.basename(source)}`));
+    for (const [index, source] of packages.entries()) {
       const bytes = readRegularFile(source);
-      const name = `${target}--${path.basename(source)}`;
+      const name = names[index];
       assert(!/[\r\n\0]/.test(name));
       const destination = path.join("release-assets", name);
       fs.writeFileSync(destination, bytes, { flag: "wx" });
