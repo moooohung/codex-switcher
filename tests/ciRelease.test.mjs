@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
-import { REPOSITORY, TARGETS, releasePlan, wixVersion, versionEdits, collectReleaseFiles, findRelease, publishRelease } from "../scripts/ci-release.mjs";
+import { REPOSITORY, TARGETS, releasePlan, wixVersion, versionEdits, collectReleaseFiles, uploadNames, findRelease, publishRelease } from "../scripts/ci-release.mjs";
 
 const sha = "abcdef1234567890abcdef1234567890abcdef12";
 const trusted = { name: "CI", event: "push", conclusion: "success", head_branch: "main", head_sha: sha, head_repository: { full_name: REPOSITORY } };
@@ -111,7 +113,7 @@ function publisherFixture(t, options = {}) {
   const assets = path.join(root, "release-assets");
   fs.mkdirSync(assets);
   for (const target of TARGETS) {
-    const file = `${target}--fixture.zip`;
+    const file = uploadNames([`${target}--${options.spaces ? "Codex Switcher" : "fixture"}.zip`])[0];
     fs.writeFileSync(path.join(assets, file), `synthetic package for ${target}`);
     fs.writeFileSync(path.join(assets, `provenance-${target}.json`), JSON.stringify({ target, ...plan, files: [file] }));
   }
@@ -208,6 +210,8 @@ test("publisher keeps failed asset and identity readbacks as drafts", async (t) 
   const cases = [
     ["missing asset", (r) => ({ ...r, assets: r.assets.slice(1) }), /missing published assets/],
     ["extra asset", (r) => ({ ...r, assets: [...r.assets, { name: "extra.zip", digest: "sha256:invalid" }] }), /Unexpected or missing/],
+    ["missing digest", (r) => ({ ...r, assets: r.assets.map((a, i) => i === 0 ? { ...a, digest: undefined } : a) }), /digest mismatch/],
+    ["arbitrary rename", (r) => ({ ...r, assets: r.assets.map((a, i) => i === 0 ? { ...a, name: "renamed.zip" } : a) }), /Unexpected uploaded asset name/],
     ["wrong digest", (r) => ({ ...r, assets: r.assets.map((a, i) => i === 0 ? { ...a, digest: "sha256:invalid" } : a) }), /digest mismatch/],
     ["duplicate asset", (r) => ({ ...r, assets: r.assets.map((a, i) => i === 0 ? r.assets[1] : a) }), /Duplicate uploaded/],
     ["changed ID", (r) => ({ ...r, id: 2 }), /ID changed/],
@@ -254,3 +258,48 @@ for (const stage of ["createResponse", "beforeUpload"]) {
     });
   });
 }
+
+test("upload names normalize spaces before provenance and reject collisions and unsafe characters", () => {
+  assert.deepEqual(uploadNames(["Codex Switcher_1.2.3.dmg"]), ["Codex-Switcher_1.2.3.dmg"]);
+  for (const names of [["Codex Switcher.zip", "Codex-Switcher.zip"], ["Fixture.zip", "fixture.zip"]]) {
+    assert.throws(() => uploadNames(names), /collision/);
+  }
+  for (const name of [".fixture.zip", "fixture.zip.", "fixture#label.zip", "fixture\t.zip", "fixtureé.zip", "../fixture.zip"]) {
+    assert.throws(() => uploadNames([name]));
+  }
+});
+
+test("publisher uses normalized package names in manifests, uploads and final checksums", (t) => {
+  const fixture = publisherFixture(t, { existing: false, spaces: true });
+  assert.equal(publishRelease(fixture.args, fixture.fakeGh), 410176291);
+  const directory = path.join(fixture.args.root, "release-assets");
+  const checksums = fs.readFileSync(path.join(directory, "checksums.txt"), "utf8");
+  for (const target of TARGETS) {
+    const name = `${target}--Codex-Switcher.zip`;
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(directory, `provenance-${target}.json`))).files, [name]);
+    const asset = fixture.getRelease().assets.find((a) => a.name === name);
+    assert(checksums.includes(`${asset.digest.slice(7)}  ${name}\n`));
+  }
+});
+
+test("stage CLI normalizes real bundle paths before writing provenance and rejects collisions before copying", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "switcher-stage-names-"));
+  t.after(() => fs.rmSync(root, { recursive: true }));
+  const source = path.join(root, "Codex Switcher.zip");
+  fs.writeFileSync(source, "package bytes");
+  const target = TARGETS[0];
+  const stage = (paths) => execFileSync(process.execPath, [fileURLToPath(new URL("../scripts/ci-release.mjs", import.meta.url)), "stage"], {
+    cwd: root, env: { ...process.env, BUILD_TARGET: target, SOURCE_SHA: sha, RELEASE_TAG: releasePlan(input).tag,
+      BUILD_VERSION: releasePlan(input).version, ARTIFACT_PATHS: JSON.stringify(paths) }, stdio: "pipe",
+  });
+  const collision = path.join(root, "Codex-Switcher.zip");
+  fs.writeFileSync(collision, "different bytes");
+  assert.throws(() => stage([source, collision]), /Upload filename collision/);
+  assert.deepEqual(fs.readdirSync(path.join(root, "release-assets")), []);
+  stage([source]);
+  const name = `${target}--Codex-Switcher.zip`;
+  assert.equal(fs.readFileSync(path.join(root, "release-assets", name), "utf8"), "package bytes");
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, "release-assets", `provenance-${target}.json`)));
+  assert.deepEqual(manifest.files, [name]);
+  assert.equal(manifest.sha, sha);
+});
