@@ -196,7 +196,7 @@ export function AddAccountModal({
                             setError("Clipboard unavailable. Copy the link manually.");
                           });
                       }}
-                      className={`px-3 py-1.5 border rounded text-xs font-medium transition-colors shrink-0 
+                      className={`px-3 py-1.5 border rounded text-xs font-medium transition-colors shrink-0
                         ${copied
                           ? "bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-700 text-green-700 dark:text-green-300"
                           : "bg-white dark:bg-gray-900 border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-800"

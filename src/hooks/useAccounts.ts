@@ -73,7 +73,7 @@ export function useAccounts() {
       setError(null);
       const accountList = await invokeBackend<AccountInfo[]>("list_accounts");
       if (generation !== loadGeneration.current) return accountList;
-      
+
       if (preserveUsage) {
         // Preserve existing usage data when just updating account info
         setAccounts((prev) => {
@@ -446,7 +446,7 @@ export function useAccounts() {
       // its cache current while a desktop webview is hidden or suspended.
       void refreshMetadata(accountList);
     });
-    
+
     // Auto-refresh usage every 60 seconds (same as official Codex CLI)
     const usageInterval = setInterval(() => {
       refreshUsage().catch(() => {});
@@ -457,7 +457,7 @@ export function useAccounts() {
           refreshMetadata().catch(() => {});
         }, 6 * 60 * 60 * 1000)
       : undefined;
-    
+
     return () => {
       clearInterval(usageInterval);
       if (metadataInterval !== undefined) clearInterval(metadataInterval);
