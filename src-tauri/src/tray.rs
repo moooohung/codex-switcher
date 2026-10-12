@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     LazyLock, Mutex,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tauri::{
     menu::{CheckMenuItemBuilder, Menu, MenuItemBuilder, PredefinedMenuItem, Submenu},
@@ -14,7 +14,8 @@ use tauri::{
 
 use crate::{
     api::usage::get_account_usage,
-    auth::{get_account, get_accounts_file, load_accounts, load_app_settings},
+    auth::{get_accounts_file, load_accounts, load_app_settings},
+    auto_switch::{quota_score, AutoSwitchStatus, RotationResult, UsageMonitor},
     commands::{
         is_codex_running_switch_block, restore_main_window, switch_account_by_id,
         window::TRAY_WINDOW,
@@ -24,6 +25,17 @@ use crate::{
 
 static TRAY_USAGE: LazyLock<Mutex<HashMap<String, UsageInfo>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static AUTO_USAGE: LazyLock<Mutex<UsageMonitor>> =
+    LazyLock::new(|| Mutex::new(UsageMonitor::default()));
+static AUTO_CHECK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static AUTO_STATUS: LazyLock<Mutex<AutoSwitchStatus>> = LazyLock::new(|| {
+    let saved = crate::auth::get_config_dir()
+        .ok()
+        .and_then(|dir| std::fs::read(dir.join("auto-switch-status.json")).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    Mutex::new(saved)
+});
 static TRAY_SWITCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static TRAY_SWITCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -217,12 +229,258 @@ fn watch_system_theme<R: Runtime>(app: AppHandle<R>) {
 
 /// Store usage reported by the main app and refresh the native menu labels.
 pub fn ingest_usage<R: Runtime>(app: &AppHandle<R>, usages: Vec<UsageInfo>) {
+    let now = Instant::now();
+    if let Ok(mut monitor) = AUTO_USAGE.lock() {
+        for usage in &usages {
+            monitor.observe(usage.clone(), now);
+        }
+    }
     if let Ok(mut cache) = TRAY_USAGE.lock() {
         for usage in usages {
             cache.insert(usage.account_id.clone(), usage);
         }
     }
     refresh_menu(app);
+    // UI fetches and the hidden-window background poller feed one controller.
+    request_auto_switch_check(app);
+}
+
+pub fn request_auto_switch_check<R: Runtime>(app: &AppHandle<R>) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        check_auto_switch(&app).await;
+    });
+}
+
+pub fn auto_switch_status() -> Result<AutoSwitchStatus, String> {
+    AUTO_STATUS
+        .lock()
+        .map(|status| status.clone())
+        .map_err(|e| e.to_string())
+}
+
+fn publish_auto_status<R: Runtime>(
+    app: &AppHandle<R>,
+    phase: &str,
+    message: String,
+    active_id: Option<&str>,
+    usage: Option<&UsageInfo>,
+    attempt_result: Option<&str>,
+) {
+    let Ok(mut status) = AUTO_STATUS.lock() else {
+        return;
+    };
+    status.checked_at = Some(chrono::Utc::now());
+    status.phase = phase.into();
+    status.message = message;
+    status.active_account_id = active_id.map(str::to_owned);
+    status.primary_used_percent = usage.and_then(|u| u.primary_used_percent);
+    status.secondary_used_percent = usage.and_then(|u| u.secondary_used_percent);
+    if let Some(result) = attempt_result {
+        status.last_attempt_at = status.checked_at;
+        status.last_attempt_result = Some(result.into());
+        status.last_attempt_message = Some(status.message.clone());
+    }
+    if phase == "checking" {
+        status.last_attempt_at = status.checked_at;
+        status.last_attempt_result = Some("running".into());
+        status.last_attempt_message = Some(status.message.clone());
+    }
+    crate::auto_switch::record_event(phase, active_id, None, None, usage);
+    // A release Windows app has no console: persist decisions and failures.
+    let saved = (|| -> anyhow::Result<()> {
+        let path = crate::auth::get_config_dir()?.join("auto-switch-status.json");
+        crate::auth::persistence::atomic_write(&path, &serde_json::to_vec_pretty(&*status)?)
+    })();
+    if let Err(error) = saved {
+        eprintln!("Could not save auto-switch status: {error}");
+    }
+    let _ = app.emit("auto-switch-status-changed", &*status);
+}
+
+async fn check_auto_switch<R: Runtime>(app: &AppHandle<R>) {
+    let Ok(_guard) = AUTO_CHECK_LOCK.try_lock() else {
+        return;
+    };
+    let settings = match load_app_settings() {
+        Ok(settings) => settings,
+        Err(error) => {
+            publish_auto_status(
+                app,
+                "failed",
+                format!("자동 전환 설정 조회 실패: {error}"),
+                None,
+                None,
+                None,
+            );
+            return;
+        }
+    };
+    if !settings.auto_switch_enabled {
+        publish_auto_status(app, "disabled", "자동 전환 꺼짐".into(), None, None, None);
+        return;
+    }
+    let store = match load_accounts() {
+        Ok(store) => store,
+        Err(error) => {
+            publish_auto_status(
+                app,
+                "failed",
+                format!("자동 전환 계정 조회 실패: {error}"),
+                None,
+                None,
+                None,
+            );
+            return;
+        }
+    };
+    let Some(active_id) = store.active_account_id.as_deref() else {
+        publish_auto_status(
+            app,
+            "waiting",
+            "자동 전환 대기 · 현재 인증 파일의 계정을 확인할 수 없습니다".into(),
+            None,
+            None,
+            None,
+        );
+        return;
+    };
+    let now = Instant::now();
+    let usage = AUTO_USAGE
+        .lock()
+        .ok()
+        .and_then(|monitor| monitor.fresh_usage(active_id, now));
+    let Some(usage) = usage else {
+        publish_auto_status(
+            app,
+            "waiting",
+            "자동 전환 대기 · 최신 사용량 조회를 기다립니다".into(),
+            Some(active_id),
+            None,
+            None,
+        );
+        return;
+    };
+    let score = match quota_score(&usage) {
+        Ok(score) => score,
+        Err(error) => {
+            publish_auto_status(
+                app,
+                "failed",
+                format!("자동 전환 사용량 조회 실패: {error}"),
+                Some(active_id),
+                Some(&usage),
+                None,
+            );
+            return;
+        }
+    };
+    if score < settings.auto_switch_threshold_percent {
+        publish_auto_status(
+            app,
+            "monitoring",
+            format!(
+                "자동 전환 감시 중 · 사용률 {score:.0}% / 전환 기준 {:.0}%",
+                settings.auto_switch_threshold_percent
+            ),
+            Some(active_id),
+            Some(&usage),
+            None,
+        );
+        return;
+    }
+    let cached = {
+        let Ok(mut monitor) = AUTO_USAGE.lock() else {
+            return;
+        };
+        if !monitor.start_attempt(active_id, now) {
+            return;
+        }
+        monitor.fresh_candidates(now)
+    };
+    publish_auto_status(
+        app,
+        "checking",
+        "한도 소진 감지 · 전환할 계정 확인 중".into(),
+        Some(active_id),
+        Some(&usage),
+        None,
+    );
+    match crate::commands::account::auto_switch_to_best_account(
+        settings.auto_switch_threshold_percent,
+        Some(usage.clone()),
+        cached,
+    )
+    .await
+    {
+        Ok(RotationResult::Switched(outcome)) => {
+            let phase = if outcome.warning.is_some() {
+                "failed"
+            } else {
+                "switched"
+            };
+            let message = outcome
+                .warning
+                .clone()
+                .map(|e| format!("인증 파일 자동 전환 완료 · Codex 재실행 실패: {e}"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "인증 파일 자동 전환 완료 · Codex: {} · 앱 내부 로그인 계정 미확인",
+                        outcome.desktop_status
+                    )
+                });
+            publish_auto_status(
+                app,
+                phase,
+                message.clone(),
+                Some(active_id),
+                Some(&usage),
+                Some(phase),
+            );
+            refresh_menu(app);
+            let _ = app.emit(ACCOUNTS_CHANGED_EVENT, ());
+            let _ = app.emit("auto-switched", &outcome);
+            #[cfg(windows)]
+            show_windows_notification("Codex Switcher - 자동 전환 결과", &message);
+        }
+        Ok(RotationResult::NoCandidate(reason)) => publish_auto_status(
+            app,
+            "waiting",
+            reason,
+            Some(active_id),
+            Some(&usage),
+            Some("waiting"),
+        ),
+        Ok(RotationResult::Deferred(reason)) => publish_auto_status(
+            app,
+            "waiting",
+            format!("자동 전환 대기 · {reason}"),
+            Some(active_id),
+            Some(&usage),
+            Some("waiting"),
+        ),
+        Ok(RotationResult::Healthy) => publish_auto_status(
+            app,
+            "monitoring",
+            "자동 전환 감시 중 · 현재 계정에 잔여 한도 있음".into(),
+            Some(active_id),
+            Some(&usage),
+            None,
+        ),
+        Err(error) => {
+            publish_auto_status(
+                app,
+                "failed",
+                format!("자동 전환 실패: {error} · 30초 후 재확인"),
+                Some(active_id),
+                Some(&usage),
+                Some("failed"),
+            );
+            let _ = app.emit("auto-switch-failed", &error);
+            #[cfg(windows)]
+            show_windows_notification("Codex Switcher - 자동 전환 실패", &error);
+        }
+    }
 }
 
 // ============================================================================
@@ -435,9 +693,26 @@ fn refresh_menu_on_main_thread<R: Runtime>(app: &AppHandle<R>) {
                 settings.tray_display_mode,
             );
             let menu = build_menu(app, &store).map_err(|error| error.to_string())?;
-            Ok((menu, title, settings.tray_display_mode))
+            let active = store
+                .accounts
+                .iter()
+                .find(|a| store.active_account_id.as_deref() == Some(a.id.as_str()));
+            let name = active
+                .map(|a| {
+                    if store.masked_account_ids.contains(&a.id) {
+                        "숨김"
+                    } else {
+                        a.name.as_str()
+                    }
+                })
+                .unwrap_or("확인할 수 없음");
+            let tooltip = format!("Codex Switcher · 인증 파일: {name}");
+            Ok((menu, title, settings.tray_display_mode, tooltip))
         }) {
-        Ok((menu, title, mode)) => {
+        Ok((menu, title, mode, tooltip)) => {
+            if let Err(error) = tray.set_tooltip(Some(tooltip)) {
+                eprintln!("Failed to refresh tray tooltip: {error}");
+            }
             if let Err(error) = tray.set_menu(Some(menu)) {
                 eprintln!("Failed to refresh tray menu: {error}");
             }
@@ -535,14 +810,12 @@ fn active_usage_title(active_account_id: Option<&str>) -> String {
         .and_then(|cache| cache.get(active_account_id).cloned());
 
     match usage {
-        Some(usage) if usage.error.is_none() => {
-            usage_title(
-                usage.primary_used_percent,
-                usage.primary_window_minutes,
-                usage.secondary_used_percent,
-                usage.secondary_window_minutes,
-            )
-        }
+        Some(usage) if usage.error.is_none() => usage_title(
+            usage.primary_used_percent,
+            usage.primary_window_minutes,
+            usage.secondary_used_percent,
+            usage.secondary_window_minutes,
+        ),
         _ => "H:-- W:--".to_string(),
     }
 }
@@ -555,13 +828,13 @@ fn usage_title(
 ) -> String {
     let mut parts = Vec::new();
     if let Some(remaining) = remaining_percent_label(primary_used_percent) {
-        let label = window_duration_label(primary_window_minutes)
-            .unwrap_or_else(|| "H".to_string());
+        let label =
+            window_duration_label(primary_window_minutes).unwrap_or_else(|| "H".to_string());
         parts.push(format!("{label}:{remaining}"));
     }
     if let Some(remaining) = remaining_percent_label(secondary_used_percent) {
-        let label = window_duration_label(secondary_window_minutes)
-            .unwrap_or_else(|| "W".to_string());
+        let label =
+            window_duration_label(secondary_window_minutes).unwrap_or_else(|| "W".to_string());
         parts.push(format!("{label}:{remaining}"));
     }
 
@@ -615,8 +888,8 @@ fn usage_suffix(account_id: &str) -> String {
 
     let mut parts = Vec::new();
     if let Some(remaining) = session_remaining_title(usage.primary_used_percent, false) {
-        let label = window_duration_label(usage.primary_window_minutes)
-            .unwrap_or_else(|| "S".to_string());
+        let label =
+            window_duration_label(usage.primary_window_minutes).unwrap_or_else(|| "S".to_string());
         parts.push(format!("{label}:{remaining}"));
     }
     if let Some(used) = usage.secondary_used_percent {
@@ -655,11 +928,20 @@ fn watch_accounts_file<R: Runtime>(app: AppHandle<R>) {
                 return;
             }
         };
-        let mut last_modified = modified_at(&accounts_path);
+        let auth_path = crate::auth::get_codex_home()
+            .ok()
+            .map(|home| home.join("auth.json"));
+        let mut last_modified = (
+            modified_at(&accounts_path),
+            auth_path.as_deref().and_then(modified_at),
+        );
 
         loop {
             std::thread::sleep(Duration::from_secs(1));
-            let modified = modified_at(&accounts_path);
+            let modified = (
+                modified_at(&accounts_path),
+                auth_path.as_deref().and_then(modified_at),
+            );
             if modified != last_modified {
                 last_modified = modified;
                 refresh_menu(&app); // keep the native menu current
@@ -675,24 +957,65 @@ fn modified_at(path: &std::path::Path) -> Option<std::time::SystemTime> {
         .ok()
 }
 
+#[cfg(windows)]
+fn show_windows_notification(title: &str, message: &str) {
+    use std::os::windows::process::CommandExt;
+    let script = format!(
+        "[void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms');          $n = New-Object System.Windows.Forms.NotifyIcon;          $n.Icon = [System.Drawing.SystemIcons]::Information;          $n.Visible = $true;          $n.ShowBalloonTip(6000, '{}', '{}', [System.Windows.Forms.ToolTipIcon]::Info);          Start-Sleep -Seconds 7; $n.Dispose()",
+        title.replace('\'', "''"),
+        message.replace('\'', "''")
+    );
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+        .creation_flags(0x08000000)
+        .spawn();
+}
+
 /// Poll the active account's usage so the tray title stays fresh even when the
-/// main window's webview poller is hidden or suspended by the OS.
+/// main window's webview poller is hidden or suspended by the OS, and trigger
+/// auto-switching when quota is running low.
 fn poll_active_account_usage<R: Runtime>(app: AppHandle<R>) {
     std::thread::spawn(move || loop {
-        let account = load_accounts()
-            .ok()
-            .and_then(|store| store.active_account_id)
-            .and_then(|id| get_account(&id).ok().flatten());
-
-        if let Some(account) = account {
-            match tauri::async_runtime::block_on(get_account_usage(&account)) {
-                // Keep the last known title on transient fetch errors.
-                Ok(usage) => ingest_usage(&app, vec![usage]),
-                Err(error) => eprintln!("Failed to poll usage for tray title: {error}"),
+        let account = load_accounts().and_then(|store| {
+            Ok(store
+                .accounts
+                .into_iter()
+                .find(|a| store.active_account_id.as_deref() == Some(a.id.as_str())))
+        });
+        match account {
+            Ok(Some(account)) => {
+                let started = Instant::now();
+                crate::auto_switch::record_event(
+                    "active_query_started",
+                    Some(&account.id),
+                    None,
+                    None,
+                    None,
+                );
+                let usage = tauri::async_runtime::block_on(get_account_usage(&account))
+                    .unwrap_or_else(|error| {
+                        UsageInfo::error(account.id.clone(), error.to_string())
+                    });
+                crate::auto_switch::record_event(
+                    "active_query_finished",
+                    Some(&account.id),
+                    None,
+                    Some(started.elapsed()),
+                    Some(&usage),
+                );
+                ingest_usage(&app, vec![usage]);
             }
+            Ok(None) => tauri::async_runtime::block_on(check_auto_switch(&app)),
+            Err(error) => publish_auto_status(
+                &app,
+                "failed",
+                format!("자동 전환 계정 조회 실패: {error}"),
+                None,
+                None,
+                None,
+            ),
         }
-
-        std::thread::sleep(Duration::from_secs(60));
+        std::thread::sleep(Duration::from_secs(10));
     });
 }
 
@@ -831,17 +1154,17 @@ mod tests {
             usage_title(None, None, Some(35.0), Some(7 * 24 * 60)),
             "7d:65%"
         );
-        assert_eq!(
-            usage_title(Some(27.0), Some(5 * 60), None, None),
-            "5h:73%"
-        );
+        assert_eq!(usage_title(Some(27.0), Some(5 * 60), None, None), "5h:73%");
         assert_eq!(usage_title(None, None, None, None), "H:-- W:--");
     }
 
     #[test]
     fn window_duration_labels_round_to_hours_and_days() {
         assert_eq!(window_duration_label(Some(5 * 60)), Some("5h".to_string()));
-        assert_eq!(window_duration_label(Some(12 * 60)), Some("12h".to_string()));
+        assert_eq!(
+            window_duration_label(Some(12 * 60)),
+            Some("12h".to_string())
+        );
         assert_eq!(
             window_duration_label(Some(7 * 24 * 60)),
             Some("7d".to_string())

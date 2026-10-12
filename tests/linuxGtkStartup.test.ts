@@ -7,6 +7,13 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const probeSource = `
+pub mod claude {
+    pub fn handle_remote_control_helper(_: &[String]) -> bool { false }
+    pub fn statusline_entry(_: &str, _: &str) -> Result<(), ()> { Ok(()) }
+}
+pub mod prompt_cache {
+    pub fn handle_helper(_: &[String]) -> bool { false }
+}
 pub fn run() {
     for name in ["GTK_MODULES", "GTK3_MODULES", "GDK_BACKEND"] {
         match std::env::var_os(name) {

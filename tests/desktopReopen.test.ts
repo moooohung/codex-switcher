@@ -25,12 +25,18 @@ test("waits for account switching before reopening the captured desktop", async 
   assert.deepEqual(calls, ["switch", "switched", "reopen:captured"]);
 });
 
-test("a failed switch leaves the desktop closed", async () => {
+test("a failed switch reopens the captured desktop and still reports failure", async () => {
   let reopened = false;
   await assert.rejects(finishForceClose({ canSwitch: true, reopenToken: "captured" }, async () => {
     throw new Error("switch failed");
   }, async () => { reopened = true; }), /switch failed/);
-  assert.equal(reopened, false);
+  assert.equal(reopened, true);
+});
+
+test("switch and recovery failures are both reported", async () => {
+  await assert.rejects(finishForceClose({ canSwitch: true, reopenToken: "captured" }, async () => {
+    throw new Error("write failed");
+  }, async () => { throw new Error("launch failed"); }), /write failed.*launch failed/);
 });
 
 test("remaining processes prevent both switching and reopening", async () => {

@@ -2,9 +2,9 @@
 
 use crate::auth::{
     add_account, create_chatgpt_account_from_refresh_token, ensure_chatgpt_tokens_fresh_locked,
-    get_active_account, import_from_auth_json, import_from_auth_json_contents, load_accounts,
-    read_current_auth, remove_account, save_accounts, set_active_account, switch_to_account,
-    sync_active_account_tokens, touch_account, AUTH_OPERATION_LOCK,
+    import_from_auth_json, import_from_auth_json_contents, load_accounts, read_current_auth,
+    remove_account, set_active_account, switch_to_account, sync_active_account_tokens,
+    touch_account, update_accounts,
 };
 use crate::types::{AccountInfo, AccountsStore, AuthData, ImportAccountsSummary, StoredAccount};
 
@@ -37,11 +37,11 @@ const SLIM_AUTH_API_KEY: u8 = 0;
 const SLIM_AUTH_CHATGPT: u8 = 1;
 
 const FULL_FILE_MAGIC: &[u8; 4] = b"CSWF";
-const FULL_FILE_VERSION: u8 = 1;
+const FULL_FILE_VERSION: u8 = 2;
 const FULL_SALT_LEN: usize = 16;
 const FULL_NONCE_LEN: usize = 24;
 const FULL_KDF_ITERATIONS: u32 = 210_000;
-const FULL_PRESET_PASSPHRASE: &str = "gT7kQ9mV2xN4pL8sR1dH6zW3cB5yF0uJ_aE7nK2tP9vM4rX1";
+const LEGACY_FULL_PASSPHRASE: &str = "gT7kQ9mV2xN4pL8sR1dH6zW3cB5yF0uJ_aE7nK2tP9vM4rX1";
 
 const MAX_IMPORT_JSON_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_IMPORT_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -94,8 +94,12 @@ pub async fn get_active_account_info() -> Result<Option<AccountInfo>, String> {
     let store = load_accounts().map_err(|e| e.to_string())?;
     let active_id = store.active_account_id.as_deref();
 
-    if let Some(active) = get_active_account().map_err(|e| e.to_string())? {
-        let mut info = AccountInfo::from_stored(&active, active_id);
+    if let Some(active) = store
+        .accounts
+        .iter()
+        .find(|a| active_id == Some(a.id.as_str()))
+    {
+        let mut info = AccountInfo::from_stored(active, active_id);
         super::usage::apply_cached_account_metadata(&mut info);
         Ok(Some(info))
     } else {
@@ -139,63 +143,151 @@ pub async fn switch_account(account_id: String) -> Result<(), String> {
 }
 
 pub async fn switch_account_by_id(account_id: &str) -> Result<(), String> {
-    let _auth_guard = AUTH_OPERATION_LOCK.lock().await;
-    let mut store = load_accounts().map_err(|e| e.to_string())?;
-
-    let target_index = store
-        .accounts
-        .iter()
-        .position(|account| account.id == account_id)
-        .ok_or_else(|| format!("Account not found: {account_id}"))?;
-
-    if store.active_account_id.as_deref() == Some(account_id) {
-        return Ok(());
-    }
-
-    ensure_codex_not_running()?;
-
-    // ChatGPT rotates single-use refresh tokens. Preserve the latest token
-    // before replacing auth.json, otherwise switching back restores a stale one.
-    if let Some(auth) = read_current_auth().map_err(|e| e.to_string())? {
-        if sync_active_account_tokens(&mut store, &auth) {
-            save_accounts(&store).map_err(|e| e.to_string())?;
-        }
-    }
-
-    let account = ensure_chatgpt_tokens_fresh_locked(&store.accounts[target_index])
+    let _auth_guard = crate::auth::lock_auth_operation("manual_switch", account_id).await;
+    let _file_guard = crate::auth::lock_auth_operations()
         .await
         .map_err(|e| e.to_string())?;
+    switch_account_locked(account_id).await
+}
 
-    // Write to ~/.codex/auth.json
-    switch_to_account(&account).map_err(|e| e.to_string())?;
-
-    // Update the active account in our store
-    set_active_account(account_id).map_err(|e| e.to_string())?;
-
-    // Update last_used_at
-    touch_account(account_id).map_err(|e| e.to_string())?;
-
-    // Restart Antigravity background process if it is running
-    // This allows it to pick up the new authorization file seamlessly
-    if let Ok(pids) = find_antigravity_processes() {
-        for pid in pids {
-            #[cfg(unix)]
-            {
-                let _ = std::process::Command::new("kill")
-                    .arg("-9")
-                    .arg(pid.to_string())
-                    .output();
-            }
-            #[cfg(windows)]
-            {
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/F", "/PID", &pid.to_string()])
-                    .output();
-            }
+async fn switch_account_locked(account_id: &str) -> Result<(), String> {
+    let store = update_accounts(|store| {
+        if let Ok(Some(auth)) = read_current_auth() {
+            sync_active_account_tokens(store, &auth);
+        }
+        Ok(store.clone())
+    })
+    .map_err(|e| e.to_string())?;
+    let target = store
+        .accounts
+        .iter()
+        .find(|a| a.id == account_id)
+        .ok_or_else(|| format!("Account not found: {account_id}"))?;
+    if let Ok(Some(auth)) = read_current_auth() {
+        if crate::auth::credentials_match_auth(target, &auth) {
+            return Ok(());
         }
     }
-
+    ensure_codex_not_running()?;
+    let account = ensure_chatgpt_tokens_fresh_locked(target)
+        .await
+        .map_err(|e| e.to_string())?;
+    switch_to_account(&account).map_err(|e| e.to_string())?;
+    set_active_account(account_id).map_err(|e| e.to_string())?;
+    touch_account(account_id).map_err(|e| e.to_string())?;
+    run_post_switch_hook(&account);
     Ok(())
+}
+
+fn synchronized_export_store() -> anyhow::Result<AccountsStore> {
+    update_accounts(|store| {
+        if let Some(auth) = read_current_auth()? {
+            sync_active_account_tokens(store, &auth);
+        }
+        Ok(store.clone())
+    })
+}
+
+fn merge_import(imported: AccountsStore) -> Result<ImportAccountsSummary, String> {
+    update_accounts(|current| {
+        let (merged, summary) = merge_accounts_store(current.clone(), imported);
+        *current = merged;
+        Ok(summary)
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// Execute generic post-switch hooks located in ~/.codex-switcher/hooks/
+pub(crate) fn run_post_switch_hook(account: &StoredAccount) {
+    let Ok(config_dir) = crate::auth::storage::get_config_dir() else {
+        return;
+    };
+    let hooks_dir = config_dir.join("hooks");
+    if !hooks_dir.is_dir() {
+        return;
+    }
+
+    let account_id = &account.id;
+    let name = &account.name;
+    let email = account.email.as_deref().unwrap_or(name);
+    let plan = account.plan_type.as_deref().unwrap_or("unknown");
+
+    #[cfg(windows)]
+    {
+        let cmd_hook = hooks_dir.join("post-switch.cmd");
+        let bat_hook = hooks_dir.join("post-switch.bat");
+        let ps1_hook = hooks_dir.join("post-switch.ps1");
+
+        let (executable, args) = if cmd_hook.is_file() {
+            (
+                "cmd.exe",
+                vec![
+                    "/c".to_string(),
+                    cmd_hook.to_string_lossy().to_string(),
+                    account_id.clone(),
+                    name.clone(),
+                    email.to_string(),
+                ],
+            )
+        } else if bat_hook.is_file() {
+            (
+                "cmd.exe",
+                vec![
+                    "/c".to_string(),
+                    bat_hook.to_string_lossy().to_string(),
+                    account_id.clone(),
+                    name.clone(),
+                    email.to_string(),
+                ],
+            )
+        } else if ps1_hook.is_file() {
+            (
+                "powershell.exe",
+                vec![
+                    "-NoProfile".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    "-File".to_string(),
+                    ps1_hook.to_string_lossy().to_string(),
+                    account_id.clone(),
+                    name.clone(),
+                    email.to_string(),
+                ],
+            )
+        } else {
+            return;
+        };
+
+        let mut cmd = std::process::Command::new(executable);
+        cmd.args(&args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .env("CODEX_SWITCHER_ACCOUNT_ID", account_id)
+            .env("CODEX_SWITCHER_ACCOUNT_NAME", name)
+            .env("CODEX_SWITCHER_ACCOUNT_EMAIL", email)
+            .env("CODEX_SWITCHER_PLAN_TYPE", plan);
+
+        let _ = cmd.spawn();
+    }
+
+    #[cfg(not(windows))]
+    {
+        let sh_hook = hooks_dir.join("post-switch.sh");
+        let hook = if sh_hook.is_file() {
+            sh_hook
+        } else {
+            hooks_dir.join("post-switch")
+        };
+
+        if hook.is_file() {
+            let _ = std::process::Command::new(&hook)
+                .args([account_id, name, email])
+                .env("CODEX_SWITCHER_ACCOUNT_ID", account_id)
+                .env("CODEX_SWITCHER_ACCOUNT_NAME", name)
+                .env("CODEX_SWITCHER_ACCOUNT_EMAIL", email)
+                .env("CODEX_SWITCHER_PLAN_TYPE", plan)
+                .spawn();
+        }
+    }
 }
 
 /// Remove an account
@@ -217,7 +309,7 @@ pub async fn rename_account(account_id: String, new_name: String) -> Result<(), 
 /// For ChatGPT accounts, only refresh token is exported.
 #[tauri::command]
 pub async fn export_accounts_slim_text() -> Result<String, String> {
-    let store = load_accounts().map_err(|e| e.to_string())?;
+    let store = synchronized_export_store().map_err(|e| e.to_string())?;
     encode_slim_payload_from_store(&store).map_err(|e| e.to_string())
 }
 
@@ -239,8 +331,7 @@ pub async fn import_accounts_slim_text(payload: String) -> Result<ImportAccounts
         })?;
     validate_imported_store(&imported).map_err(|e| format!("{e:#}"))?;
 
-    let (merged, summary) = merge_accounts_store(current, imported);
-    save_accounts(&merged).map_err(|e| e.to_string())?;
+    let summary = merge_import(imported)?;
     Ok(ImportAccountsSummary {
         total_in_payload,
         imported_count: summary.imported_count,
@@ -250,113 +341,47 @@ pub async fn import_accounts_slim_text(payload: String) -> Result<ImportAccounts
 
 /// Export full account config as an encrypted file.
 #[tauri::command]
-pub async fn export_accounts_full_encrypted_file(path: String) -> Result<(), String> {
-    let store = load_accounts().map_err(|e| e.to_string())?;
-    let encrypted =
-        encode_full_encrypted_store(&store, FULL_PRESET_PASSPHRASE).map_err(|e| e.to_string())?;
+pub async fn export_accounts_full_encrypted_file(
+    path: String,
+    passphrase: String,
+) -> Result<(), String> {
+    let store = synchronized_export_store().map_err(|e| e.to_string())?;
+    let encrypted = encode_full_encrypted_store(&store, &passphrase).map_err(|e| e.to_string())?;
     write_encrypted_file(&path, &encrypted).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 /// Export full account config as encrypted bytes for browser clients.
-pub async fn export_accounts_full_encrypted_bytes() -> Result<Vec<u8>, String> {
-    let store = load_accounts().map_err(|e| e.to_string())?;
-    encode_full_encrypted_store(&store, FULL_PRESET_PASSPHRASE).map_err(|e| e.to_string())
+pub async fn export_accounts_full_encrypted_bytes(passphrase: String) -> Result<Vec<u8>, String> {
+    let store = synchronized_export_store().map_err(|e| e.to_string())?;
+    encode_full_encrypted_store(&store, &passphrase).map_err(|e| e.to_string())
 }
 
 /// Import full account config from an encrypted file, skipping existing accounts.
 #[tauri::command]
 pub async fn import_accounts_full_encrypted_file(
     path: String,
+    passphrase: String,
 ) -> Result<ImportAccountsSummary, String> {
     let encrypted = read_encrypted_file(&path).map_err(|e| e.to_string())?;
-    let imported = decode_full_encrypted_store(&encrypted, FULL_PRESET_PASSPHRASE)
-        .map_err(|e| e.to_string())?;
+    let imported =
+        decode_full_encrypted_store(&encrypted, &passphrase).map_err(|e| e.to_string())?;
     validate_imported_store(&imported).map_err(|e| e.to_string())?;
 
-    let current = load_accounts().map_err(|e| e.to_string())?;
-    let (merged, summary) = merge_accounts_store(current, imported);
-    save_accounts(&merged).map_err(|e| e.to_string())?;
+    let summary = merge_import(imported)?;
     Ok(summary)
 }
 
 /// Import full account config from encrypted bytes uploaded through the browser UI.
 pub async fn import_accounts_full_encrypted_bytes(
     bytes: Vec<u8>,
+    passphrase: String,
 ) -> Result<ImportAccountsSummary, String> {
-    let imported =
-        decode_full_encrypted_store(&bytes, FULL_PRESET_PASSPHRASE).map_err(|e| e.to_string())?;
+    let imported = decode_full_encrypted_store(&bytes, &passphrase).map_err(|e| e.to_string())?;
     validate_imported_store(&imported).map_err(|e| e.to_string())?;
 
-    let current = load_accounts().map_err(|e| e.to_string())?;
-    let (merged, summary) = merge_accounts_store(current, imported);
-    save_accounts(&merged).map_err(|e| e.to_string())?;
+    let summary = merge_import(imported)?;
     Ok(summary)
-}
-
-/// Find all running Antigravity codex assistant processes
-fn find_antigravity_processes() -> anyhow::Result<Vec<u32>> {
-    let mut pids = Vec::new();
-
-    #[cfg(unix)]
-    {
-        // Use ps with custom format to get the pid and full command line
-        let output = std::process::Command::new("ps")
-            .args(["-eo", "pid,command"])
-            .output()?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines().skip(1) {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            if let Some((pid_str, command)) = line.split_once(' ') {
-                let pid_str = pid_str.trim();
-                let command = command.trim();
-
-                // Antigravity processes have a specific path format
-                let is_antigravity = (command.contains(".antigravity/extensions/openai.chatgpt")
-                    || command.contains(".vscode/extensions/openai.chatgpt"))
-                    && (command.ends_with("codex app-server --analytics-default-enabled")
-                        || command.contains("/codex app-server"));
-
-                if is_antigravity {
-                    if let Ok(pid) = pid_str.parse::<u32>() {
-                        pids.push(pid);
-                    }
-                }
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        // Use tasklist on Windows
-        // For Windows we might need a more precise WMI query to get command line args,
-        // but for now we look for codex.exe PIDs and verify they're not ours
-        let output = std::process::Command::new("tasklist")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args(["/FI", "IMAGENAME eq codex.exe", "/FO", "CSV", "/NH"])
-            .output()?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() > 1 {
-                let name = parts[0].trim_matches('"').to_lowercase();
-                if name == "codex.exe" {
-                    let pid_str = parts[1].trim_matches('"');
-                    if let Ok(pid) = pid_str.parse::<u32>() {
-                        pids.push(pid);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(pids)
 }
 
 fn encode_slim_payload_from_store(store: &AccountsStore) -> anyhow::Result<String> {
@@ -556,7 +581,13 @@ async fn restore_slim_accounts(
     Ok(restored)
 }
 
-fn encode_full_encrypted_store(store: &AccountsStore, passphrase: &str) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn encode_full_encrypted_store<T: serde::Serialize>(
+    store: &T,
+    passphrase: &str,
+) -> anyhow::Result<Vec<u8>> {
+    if passphrase.chars().count() < 12 {
+        anyhow::bail!("Use a backup password of at least 12 characters");
+    }
     let json = serde_json::to_vec(store).context("Failed to serialize account store")?;
     let compressed = compress_bytes(&json).context("Failed to compress account store")?;
 
@@ -582,10 +613,10 @@ fn encode_full_encrypted_store(store: &AccountsStore, passphrase: &str) -> anyho
     Ok(out)
 }
 
-fn decode_full_encrypted_store(
+pub(crate) fn decode_full_encrypted_payload<T: serde::de::DeserializeOwned>(
     file_bytes: &[u8],
     passphrase: &str,
-) -> anyhow::Result<AccountsStore> {
+) -> anyhow::Result<T> {
     if file_bytes.len() as u64 > MAX_IMPORT_FILE_BYTES {
         anyhow::bail!("Encrypted file is too large");
     }
@@ -600,7 +631,7 @@ fn decode_full_encrypted_store(
     }
 
     let version = file_bytes[4];
-    if version != FULL_FILE_VERSION {
+    if version != 1 && version != FULL_FILE_VERSION {
         anyhow::bail!("Unsupported encrypted file version: {version}");
     }
 
@@ -612,7 +643,12 @@ fn decode_full_encrypted_store(
     let nonce = &file_bytes[nonce_start..ciphertext_start];
     let ciphertext = &file_bytes[ciphertext_start..];
 
-    let key = derive_encryption_key(passphrase, salt);
+    let password = if version == 1 {
+        LEGACY_FULL_PASSPHRASE
+    } else {
+        passphrase
+    };
+    let key = derive_encryption_key(password, salt);
     let cipher = XChaCha20Poly1305::new((&key).into());
     let compressed = cipher
         .decrypt(XNonce::from_slice(nonce), ciphertext)
@@ -623,7 +659,7 @@ fn decode_full_encrypted_store(
     let json = decompress_bytes_with_limit(&compressed, MAX_IMPORT_JSON_BYTES)
         .context("Failed to decompress decrypted payload")?;
 
-    let store: AccountsStore =
+    let store: T =
         serde_json::from_slice(&json).context("Failed to parse decrypted account payload")?;
 
     Ok(store)
@@ -633,6 +669,18 @@ fn derive_encryption_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
     let mut key = [0u8; 32];
     pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), salt, FULL_KDF_ITERATIONS, &mut key);
     key
+}
+
+pub(crate) fn decode_full_encrypted_store(
+    file_bytes: &[u8],
+    passphrase: &str,
+) -> anyhow::Result<AccountsStore> {
+    let value: serde_json::Value = decode_full_encrypted_payload(file_bytes, passphrase)?;
+    anyhow::ensure!(
+        value.get("provider").is_none(),
+        "This backup belongs to another provider"
+    );
+    Ok(serde_json::from_value(value)?)
 }
 
 fn compress_bytes(input: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -710,7 +758,7 @@ fn merge_accounts_store(
     imported: AccountsStore,
 ) -> (AccountsStore, ImportAccountsSummary) {
     let imported_version = imported.version;
-    let imported_active_id = imported.active_account_id;
+
     let total_in_payload = imported.accounts.len();
     let mut imported_count = 0usize;
     let mut existing_ids: HashSet<String> = current.accounts.iter().map(|a| a.id.clone()).collect();
@@ -729,21 +777,13 @@ fn merge_accounts_store(
 
     current.version = current.version.max(imported_version).max(1);
 
-    let current_active_is_valid = current
+    // Importing a backup must never imply that its credentials were installed.
+    if !current
         .active_account_id
         .as_ref()
-        .is_some_and(|id| current.accounts.iter().any(|a| &a.id == id));
-
-    if !current_active_is_valid {
-        if let Some(imported_active) = imported_active_id {
-            if current.accounts.iter().any(|a| a.id == imported_active) {
-                current.active_account_id = Some(imported_active);
-            } else {
-                current.active_account_id = current.accounts.first().map(|a| a.id.clone());
-            }
-        } else {
-            current.active_account_id = current.accounts.first().map(|a| a.id.clone());
-        }
+        .is_some_and(|id| current.accounts.iter().any(|a| &a.id == id))
+    {
+        current.active_account_id = None;
     }
 
     (
@@ -766,4 +806,339 @@ pub async fn get_masked_account_ids() -> Result<Vec<String>, String> {
 #[tauri::command]
 pub async fn set_masked_account_ids(ids: Vec<String>) -> Result<(), String> {
     crate::auth::storage::set_masked_account_ids(ids).map_err(|e| e.to_string())
+}
+
+/// Automatically use a verified available account when the active quota is low.
+/// Reports credential installation and desktop reopening as separate outcomes.
+pub async fn auto_switch_to_best_account(
+    threshold_percent: f64,
+    observed: Option<crate::types::UsageInfo>,
+    cached: std::collections::HashMap<String, crate::types::UsageInfo>,
+) -> Result<crate::auto_switch::RotationResult, String> {
+    let Ok(_automatic_guard) = AUTO_SWITCH_LOCK.try_lock() else {
+        return Err("다른 자동 전환 작업이 진행 중입니다".into());
+    };
+    let store = load_accounts().map_err(|e| e.to_string())?;
+    let active = store
+        .accounts
+        .iter()
+        .find(|a| store.active_account_id.as_deref() == Some(a.id.as_str()))
+        .ok_or("현재 인증 파일의 계정을 확인할 수 없습니다")?;
+    let active_usage = match observed {
+        Some(usage) => usage,
+        None => crate::api::usage::get_account_usage(active)
+            .await
+            .map_err(|e| e.to_string())?,
+    };
+    let from_name = active.name.clone();
+    let observed_at = std::time::Instant::now();
+    let preference = crate::auth::load_app_settings()
+        .map_err(|e| e.to_string())?
+        .auto_switch_plan_preference;
+    let result = crate::auto_switch::evaluate_rotation_with_preference(
+        active,
+        &store.accounts,
+        &active_usage,
+        threshold_percent,
+        preference,
+        |candidate| {
+            let known = cached.get(&candidate.id).cloned();
+            let source = active.id.clone();
+            async move {
+                crate::auto_switch::record_event(
+                    "candidate_query_started",
+                    Some(&source),
+                    Some(&candidate.id),
+                    None,
+                    None,
+                );
+                if let Some(usage) = known.filter(|u| crate::auto_switch::quota_score(u).is_ok()) {
+                    crate::auto_switch::record_event(
+                        "candidate_cached",
+                        Some(&source),
+                        Some(&candidate.id),
+                        None,
+                        Some(&usage),
+                    );
+                    return Ok(usage);
+                }
+                let started = std::time::Instant::now();
+                let result = crate::api::usage::get_account_usage(&candidate)
+                    .await
+                    .map_err(|e| e.to_string());
+                crate::auto_switch::record_event(
+                    "candidate_query_finished",
+                    Some(&source),
+                    Some(&candidate.id),
+                    Some(started.elapsed()),
+                    result.as_ref().ok(),
+                );
+                result
+            }
+        },
+        |active_id, target| activate_auto_switch(active_id, from_name, target, observed_at),
+    )
+    .await;
+    crate::auto_switch::defer_auth_busy(result)
+}
+
+async fn activate_auto_switch(
+    active_id: String,
+    from_name: String,
+    target: StoredAccount,
+    observed_at: std::time::Instant,
+) -> Result<AutoSwitchOutcome, String> {
+    let target_id = target.id.clone();
+    let to_name = target.name.clone();
+    // Serialize the final decision with manual switches and token refreshes.
+    crate::auto_switch::record_event(
+        "auth_lock_wait",
+        Some(&active_id),
+        Some(&target_id),
+        Some(observed_at.elapsed()),
+        None,
+    );
+    let _auth_guard = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        crate::auth::lock_auth_operation("auto_switch", &active_id),
+    )
+    .await
+    .map_err(|_| crate::auto_switch::AUTH_BUSY_RETRY.to_string())?;
+    crate::auto_switch::record_event(
+        "auth_file_lock_wait",
+        Some(&active_id),
+        Some(&target_id),
+        Some(observed_at.elapsed()),
+        None,
+    );
+    let _file_guard = crate::auth::lock_auth_operations()
+        .await
+        .map_err(|e| e.to_string())?;
+    crate::auto_switch::record_event(
+        "auth_lock_acquired",
+        Some(&active_id),
+        Some(&target_id),
+        Some(observed_at.elapsed()),
+        None,
+    );
+    validate_auto_decision(&active_id, observed_at)?;
+    crate::auto_switch::record_event(
+        "target_credentials_preparing",
+        Some(&active_id),
+        Some(&target_id),
+        Some(observed_at.elapsed()),
+        None,
+    );
+    // Finish any target token rotation before closing the user's desktop.
+    // switch_account_locked will re-read these persisted credentials afterward.
+    ensure_chatgpt_tokens_fresh_locked(&target)
+        .await
+        .map_err(|e| e.to_string())?;
+    crate::auto_switch::record_event(
+        "target_credentials_ready",
+        Some(&active_id),
+        Some(&target_id),
+        Some(observed_at.elapsed()),
+        None,
+    );
+    if let Err(error) = validate_auto_decision(&active_id, observed_at) {
+        crate::auto_switch::record_event(
+            "decision_cancelled",
+            Some(&active_id),
+            Some(&target_id),
+            Some(observed_at.elapsed()),
+            None,
+        );
+        return Err(error);
+    }
+    crate::auto_switch::record_event(
+        "desktop_close_started",
+        Some(&active_id),
+        Some(&target_id),
+        Some(observed_at.elapsed()),
+        None,
+    );
+    let (pids, _) = crate::commands::process::find_codex_processes().map_err(|e| e.to_string())?;
+    let reopen_token = if !pids.is_empty() {
+        // Preserve automatic desktop rotation, but only close roots whose exact
+        // desktop identity was captured and can be reopened.
+        let result = crate::commands::process::kill_codex_processes(Some(true), Some(true)).await?;
+        if !result.failed_pids.is_empty() {
+            if let Some(token) = result.reopen_token {
+                let _ = crate::commands::reopen_closed_codex_desktop(token).await;
+            }
+            return Err("Codex did not close; credentials were not switched. Close the remaining Codex processes and retry.".into());
+        }
+        result.reopen_token
+    } else {
+        None
+    };
+    crate::auto_switch::record_event(
+        "desktop_closed",
+        Some(&active_id),
+        Some(&target_id),
+        Some(observed_at.elapsed()),
+        None,
+    );
+    if let Err(error) = switch_account_locked(&target_id).await {
+        let recovery = if let Some(token) = reopen_token {
+            crate::commands::reopen_closed_codex_desktop(token)
+                .await
+                .err()
+        } else {
+            None
+        };
+        return Err(format!(
+            "{error}{}",
+            recovery
+                .map(|e| format!("; reopening failed: {e}"))
+                .unwrap_or_default()
+        ));
+    }
+    crate::auto_switch::record_event(
+        "credentials_installed",
+        Some(&active_id),
+        Some(&target_id),
+        Some(observed_at.elapsed()),
+        None,
+    );
+    let (desktop_status, warning) = if let Some(token) = reopen_token {
+        match crate::commands::reopen_closed_codex_desktop(token).await {
+            Ok(()) => ("reopened".to_string(), None),
+            Err(error) => ("reopen_failed".to_string(), Some(error)),
+        }
+    } else {
+        ("not_running".to_string(), None)
+    };
+    crate::auto_switch::record_event(
+        &desktop_status,
+        Some(&active_id),
+        Some(&target_id),
+        Some(observed_at.elapsed()),
+        None,
+    );
+    Ok(AutoSwitchOutcome {
+        from: from_name,
+        to: to_name,
+        desktop_status,
+        warning,
+    })
+}
+
+static AUTO_SWITCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn validate_auto_decision(active_id: &str, observed_at: std::time::Instant) -> Result<(), String> {
+    if !crate::auth::load_app_settings()
+        .map_err(|e| e.to_string())?
+        .auto_switch_enabled
+    {
+        return Err("자동 전환이 꺼져 있어 전환을 취소했습니다".into());
+    }
+    if observed_at.elapsed() > crate::auto_switch::USAGE_MAX_AGE {
+        return Err("사용량 확인 이후 시간이 지나 다시 조회합니다".into());
+    }
+    if load_accounts()
+        .map_err(|e| e.to_string())?
+        .active_account_id
+        .as_deref()
+        != Some(active_id)
+    {
+        crate::auto_switch::record_event(
+            "cancelled_account_changed",
+            Some(active_id),
+            None,
+            Some(observed_at.elapsed()),
+            None,
+        );
+        return Err("자동 전환 판단 중 현재 계정이 변경되어 다시 확인합니다".into());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AutoSwitchOutcome {
+    pub from: String,
+    pub to: String,
+    pub desktop_status: String,
+    pub warning: Option<String>,
+}
+
+/// Trigger an immediate check and auto-switch if quota is low (called from UI or testing)
+#[tauri::command]
+pub async fn trigger_auto_switch() -> Result<Option<String>, String> {
+    let settings = crate::auth::load_app_settings().unwrap_or_default();
+    if !settings.auto_switch_enabled {
+        return Ok(None);
+    }
+    match auto_switch_to_best_account(
+        settings.auto_switch_threshold_percent,
+        None,
+        Default::default(),
+    )
+    .await?
+    {
+        crate::auto_switch::RotationResult::Switched(outcome) => Ok(Some(format!(
+            "Credential file changed from {} to {}; desktop: {}{}",
+            outcome.from,
+            outcome.to,
+            outcome.desktop_status,
+            outcome
+                .warning
+                .map(|e| format!("; {e}"))
+                .unwrap_or_default()
+        ))),
+        crate::auto_switch::RotationResult::Healthy => Ok(None),
+        crate::auto_switch::RotationResult::Deferred(reason) => Err(reason),
+        crate::auto_switch::RotationResult::NoCandidate(reason) => Err(reason),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn encrypted_backups_require_a_user_password_and_reject_wrong_passwords() {
+        let mut store = AccountsStore::default();
+        store.accounts.push(StoredAccount::new_api_key(
+            "synthetic".into(),
+            "fake".into(),
+        ));
+        assert!(encode_full_encrypted_store(&store, "short").is_err());
+        let bytes = encode_full_encrypted_store(&store, "correct-test-password").unwrap();
+        assert_eq!(bytes[4], 2);
+        assert!(decode_full_encrypted_store(&bytes, "wrong-test-password").is_err());
+        assert_eq!(
+            decode_full_encrypted_store(&bytes, "correct-test-password")
+                .unwrap()
+                .accounts
+                .len(),
+            1
+        );
+        // Existing v1 backups remain importable, but exports always use v2.
+        let mut legacy = encode_full_encrypted_store(&store, LEGACY_FULL_PASSPHRASE).unwrap();
+        legacy[4] = 1;
+        assert_eq!(
+            decode_full_encrypted_store(&legacy, "")
+                .unwrap()
+                .accounts
+                .len(),
+            1
+        );
+    }
+    #[test]
+    fn importing_does_not_select_an_uninstalled_account_or_drop_current_changes() {
+        let mut current = AccountsStore::default();
+        current.accounts.push(StoredAccount::new_api_key(
+            "already-added".into(),
+            "fake-a".into(),
+        ));
+        let mut imported = AccountsStore::default();
+        let account = StoredAccount::new_api_key("imported".into(), "fake-b".into());
+        imported.active_account_id = Some(account.id.clone());
+        imported.accounts.push(account);
+        let (merged, summary) = merge_accounts_store(current, imported);
+        assert_eq!(merged.accounts.len(), 2);
+        assert_eq!(summary.imported_count, 1);
+        assert!(merged.active_account_id.is_none());
+    }
 }

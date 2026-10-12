@@ -12,6 +12,7 @@ export function useAccounts() {
   const [accounts, setAccounts] = useState<AccountWithUsage[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const loadGeneration = useRef(0);
   const accountsRef = useRef<AccountWithUsage[]>([]);
   const metadataRefreshInFlightRef = useRef(new Set<string>());
   const maxConcurrentUsageRequests = 10;
@@ -66,10 +67,12 @@ export function useAccounts() {
   );
 
   const loadAccounts = useCallback(async (preserveUsage = false) => {
+    const generation = ++loadGeneration.current;
     try {
       setLoading(true);
       setError(null);
       const accountList = await invokeBackend<AccountInfo[]>("list_accounts");
+      if (generation !== loadGeneration.current) return accountList;
       
       if (preserveUsage) {
         // Preserve existing usage data when just updating account info
@@ -88,10 +91,10 @@ export function useAccounts() {
       }
       return accountList;
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (generation === loadGeneration.current) { setError(err instanceof Error ? err.message : String(err)); setAccounts((prev) => prev.map((a) => ({ ...a, is_active: false }))); }
       return [];
     } finally {
-      setLoading(false);
+      if (generation === loadGeneration.current) setLoading(false);
     }
   }, []);
 
@@ -352,7 +355,7 @@ export function useAccounts() {
     try {
       const account = await invokeBackend<AccountInfo>("complete_login");
       const accountList = await loadAccounts();
-      await refreshUsage(accountList);
+      void refreshUsage(accountList);
       return account;
     } catch (err) {
       throw err;
@@ -384,9 +387,9 @@ export function useAccounts() {
   );
 
   const exportAccountsFullEncryptedFile = useCallback(
-    async (path: string) => {
+    async (path: string, passphrase: string) => {
       try {
-        await invokeBackend("export_accounts_full_encrypted_file", { path });
+        await invokeBackend("export_accounts_full_encrypted_file", { path, passphrase });
       } catch (err) {
         throw err;
       }
@@ -395,11 +398,11 @@ export function useAccounts() {
   );
 
   const importAccountsFullEncryptedFile = useCallback(
-    async (path: string) => {
+    async (path: string, passphrase: string) => {
       try {
         const summary = await invokeBackend<ImportAccountsSummary>(
           "import_accounts_full_encrypted_file",
-          { path }
+          { path, passphrase }
         );
         const accountList = await loadAccounts();
         await refreshUsage(accountList);
@@ -473,6 +476,13 @@ export function useAccounts() {
     })();
 
     return () => unlisten?.();
+  }, [loadAccounts]);
+
+  useEffect(() => {
+    const refresh = () => { void loadAccounts(true); };
+    window.addEventListener("focus", refresh);
+    const interval = window.setInterval(refresh, 5000);
+    return () => { window.removeEventListener("focus", refresh); window.clearInterval(interval); };
   }, [loadAccounts]);
 
   return {

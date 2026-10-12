@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef } from "react";
 import {
   describeFileSource,
   isTauriRuntime,
@@ -12,7 +12,8 @@ interface AddAccountModalProps {
   onClose: () => void;
   onImportFile: (source: FileSource, name: string) => Promise<void>;
   onStartOAuth: (name: string) => Promise<{ auth_url: string }>;
-  onCompleteOAuth: () => Promise<unknown>;
+  onCompleteOAuth: () => Promise<{ id: string }>;
+  onOAuthAdded: (id: string) => Promise<void>;
   onCancelOAuth: () => Promise<void>;
 }
 
@@ -24,8 +25,10 @@ export function AddAccountModal({
   onImportFile,
   onStartOAuth,
   onCompleteOAuth,
+  onOAuthAdded,
   onCancelOAuth,
 }: AddAccountModalProps) {
+  const generation = useRef(0);
   const [activeTab, setActiveTab] = useState<Tab>("oauth");
   const [name, setName] = useState("");
   const [fileSource, setFileSource] = useState<FileSource | null>(null);
@@ -47,7 +50,8 @@ export function AddAccountModal({
   };
 
   const handleClose = () => {
-    if (oauthPending) {
+    generation.current += 1;
+    if (oauthPending || loading) {
       onCancelOAuth();
     }
     resetForm();
@@ -55,18 +59,23 @@ export function AddAccountModal({
   };
 
   const handleOAuthLogin = async () => {
+    const current = ++generation.current;
     try {
       setLoading(true);
       setError(null);
       const info = await onStartOAuth(name.trim());
+      if (current !== generation.current) return;
       setAuthUrl(info.auth_url);
       setOauthPending(true);
       setLoading(false);
 
       // Wait for completion
-      await onCompleteOAuth();
-      handleClose();
+      const account = await onCompleteOAuth();
+      if (current !== generation.current) return;
+      resetForm(); onClose();
+      await onOAuthAdded(account.id);
     } catch (err) {
+      if (current !== generation.current) return;
       setError(err instanceof Error ? err.message : String(err));
       setLoading(false);
       setOauthPending(false);
@@ -121,7 +130,8 @@ export function AddAccountModal({
             <button
               key={tab}
               onClick={() => {
-                if (tab === "import" && oauthPending) {
+                if (tab === "import" && (oauthPending || loading)) {
+                  generation.current += 1;
                   void onCancelOAuth().catch((err) => {
                     console.error("Failed to cancel login:", err);
                   });

@@ -11,6 +11,12 @@ node_modules
 dist
 dist-ssr
 *.local
+.playwright-cli/
+output/
+*.jsonl
+.env
+.env.*
+!*.example
 
 # Editor directories and files
 .vscode

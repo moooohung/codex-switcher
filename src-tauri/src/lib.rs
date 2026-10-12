@@ -4,7 +4,15 @@ pub mod api;
 #[cfg(desktop)]
 pub mod app_menu;
 pub mod auth;
+pub mod auto_switch;
+pub mod claude;
 pub mod commands;
+pub mod prompt_cache;
+mod prompt_cache_body;
+pub mod prompt_cache_codex;
+pub mod prompt_cache_keepalive;
+pub mod prompt_cache_resume;
+mod prompt_cache_transcript;
 #[cfg(desktop)]
 pub mod tray;
 pub mod types;
@@ -25,16 +33,19 @@ use tauri::Emitter;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            commands::restore_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            claude::start_monitor();
             #[cfg(desktop)]
             {
-                app.handle()
-                    .plugin(tauri_plugin_updater::Builder::new().build())?;
                 app_menu::setup(app.handle())?;
                 tray::setup(app.handle())?;
+                commands::restore_main_window(app.handle());
             }
             Ok(())
         })
@@ -60,8 +71,16 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            prompt_cache::get_prompt_cache_status,
+            prompt_cache::set_prompt_cache_auto_keepalive,
+            prompt_cache::open_prompt_cache_session,
+            prompt_cache_resume::list_prompt_cache_sessions,
+            claude::commands::claude_command,
             commands::get_display_settings,
+            commands::get_auto_switch_status,
             commands::set_tray_display_mode,
+            commands::set_auto_switch_settings,
+            commands::trigger_auto_switch,
             commands::open_codex_app,
             commands::get_codex_reopen_info,
             commands::reopen_closed_codex_desktop,

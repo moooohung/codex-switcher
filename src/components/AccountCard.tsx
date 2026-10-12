@@ -1,14 +1,18 @@
 import { useCallback, useState, useRef, useEffect } from "react";
 import type { AccountResetCredits, AccountUsageStats as AccountUsageStatsInfo, AccountWithUsage } from "../types";
 import { invokeBackend } from "../lib/platform";
+import { invokeClaude } from "../lib/claude";
 import { AccountUsageStats } from "./AccountUsageStats";
 import { ResetCreditsMenu } from "./ResetCreditsMenu";
 import { UsageBar } from "./UsageBar";
+import { PromptCacheBar } from "./PromptCacheBar";
 
 const RESET_CREDITS_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const USAGE_STATS_OPEN_STORAGE_KEY_PREFIX = "usage-stats-open:";
 
 interface AccountCardProps {
+  provider?: "codex" | "claude";
+  usageObservedAt?: number | null;
   account: AccountWithUsage;
   onSwitch: () => void;
   onWarmup: () => Promise<void>;
@@ -17,6 +21,8 @@ interface AccountCardProps {
   onRename: (newName: string) => Promise<void>;
   switching?: boolean;
   switchDisabled?: boolean;
+  onReauthenticate?: () => void;
+  reauthenticateDisabled?: boolean;
   codexRunning?: boolean;
   warmingUp?: boolean;
   masked?: boolean;
@@ -96,6 +102,8 @@ function BlurredText({ children, blur }: { children: React.ReactNode; blur: bool
 }
 
 export function AccountCard({
+  provider = "codex",
+  usageObservedAt,
   account,
   onSwitch,
   onWarmup,
@@ -104,6 +112,8 @@ export function AccountCard({
   onRename,
   switching,
   switchDisabled,
+  onReauthenticate,
+  reauthenticateDisabled,
   codexRunning = false,
   warmingUp,
   masked = false,
@@ -158,10 +168,14 @@ export function AccountCard({
   }, [isEditing]);
 
   useEffect(() => {
+    if (provider === "claude") {
+      setLastRefresh(usageObservedAt ? new Date(usageObservedAt * 1000) : null);
+      return;
+    }
     if (account.usage && !account.usage.error) {
       setLastRefresh(new Date());
     }
-  }, [account.usage]);
+  }, [account.usage, provider, usageObservedAt]);
 
   const handleRefresh = async () => {
     setIsRefreshing(true);
@@ -220,22 +234,22 @@ export function AccountCard({
   const loadResetCredits = useCallback(async () => {
     const requestId = ++resetRequestSeq.current;
 
-    if (account.auth_mode !== "chat_g_p_t") {
+    if (account.auth_mode !== "chat_g_p_t" && provider !== "claude") {
       setResetCredits(null);
       return;
     }
 
     try {
-      const stats = await invokeBackend<AccountUsageStatsInfo>("get_account_usage_stats", {
-        accountId: account.id,
-      });
+      const stats = provider === "claude"
+        ? await invokeClaude<AccountUsageStatsInfo>("stats", { accountId: account.id })
+        : await invokeBackend<AccountUsageStatsInfo>("get_account_usage_stats", { accountId: account.id });
       if (requestId !== resetRequestSeq.current) return;
       setResetCredits(stats.account_id === account.id ? stats.reset_credits : null);
     } catch {
       if (requestId !== resetRequestSeq.current) return;
       setResetCredits(null);
     }
-  }, [account.auth_mode, account.id]);
+  }, [account.auth_mode, account.id, provider]);
 
   const handleStatsLoaded = useCallback(
     (stats: AccountUsageStatsInfo | null) => {
@@ -353,6 +367,7 @@ export function AccountCard({
       <div className="mb-3">
         <UsageBar usage={account.usage} loading={isRefreshing || account.usageLoading} />
       </div>
+      <PromptCacheBar provider={provider} accountId={account.id} />
 
       {/* Last refresh time */}
       <div className="flex flex-wrap items-center justify-between gap-2 text-xs mb-3">
@@ -368,12 +383,22 @@ export function AccountCard({
 
       {/* Actions */}
       <div className="flex gap-2 mt-3">
-        {account.is_active ? (
+        {onReauthenticate ? (
           <button
-            disabled
+            onClick={onReauthenticate}
+            disabled={reauthenticateDisabled}
+            className="flex-1 px-4 py-2 text-sm font-medium rounded-lg bg-gray-900 hover:bg-gray-800 dark:bg-gray-100 dark:hover:bg-gray-200 text-white dark:text-gray-900 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            재로그인
+          </button>
+        ) : account.is_active ? (
+          <button
+            onClick={onSwitch}
+            disabled={switching || switchDisabled}
+            title="인증 파일 적용 상태입니다. 눌러서 인증 파일을 다시 적용할 수 있습니다."
             className="flex-1 px-4 py-2 text-sm font-medium rounded-lg bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 border border-gray-200 dark:border-gray-700 cursor-default"
           >
-            ✓ Active
+            ✓ 인증 파일 적용 · 다시 적용
           </button>
         ) : (
           <button
@@ -398,7 +423,7 @@ export function AccountCard({
           onClick={() => {
             void onWarmup();
           }}
-          disabled={warmingUp}
+          disabled={warmingUp || Boolean(onReauthenticate)}
           className={`px-3 py-2 text-sm rounded-lg transition-colors ${
             warmingUp
               ? "bg-amber-100 dark:bg-amber-900/30 text-amber-500 dark:text-amber-300"
@@ -462,8 +487,9 @@ export function AccountCard({
       </div>
 
       <AccountUsageStats
+        provider={provider}
         accountId={account.id}
-        enabled={account.auth_mode === "chat_g_p_t"}
+        enabled={account.auth_mode === "chat_g_p_t" || provider === "claude"}
         open={statsOpen}
         usage={account.usage}
         usageLoading={account.usageLoading}

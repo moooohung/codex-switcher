@@ -8,6 +8,10 @@ mod desktop_reopen;
 pub use desktop_reopen::*;
 
 #[cfg(any(windows, test))]
+#[path = "windows_close.rs"]
+mod windows_close;
+
+#[cfg(any(windows, test))]
 use anyhow::Context;
 
 #[cfg(unix)]
@@ -127,11 +131,20 @@ fn close_codex_processes_blocking(
     // Capture exact desktop identities before termination. Detection failure must
     // never prevent the existing close-only flow.
     let desktops = if reopen_desktop || (cfg!(target_os = "macos") && !force_close) {
-        desktop_reopen::capture_desktops(&pids).unwrap_or_default()
+        desktop_reopen::capture_desktops(&pids).map_err(|e| {
+            format!("Could not identify desktop for reopening; nothing was closed: {e}")
+        })?
     } else {
         Vec::new()
     };
     let targeted_count = pids.len();
+    if reopen_desktop
+        && pids
+            .iter()
+            .any(|pid| !desktop_reopen::desktop_pids(&desktops).contains(pid))
+    {
+        return Err("Not every running Codex root is a reopenable desktop; nothing was closed. Close CLI sessions manually or disable desktop reopening.".into());
+    }
     let mut killed_pids = Vec::new();
     let mut failed_pids = Vec::new();
 
@@ -145,7 +158,26 @@ fn close_codex_processes_blocking(
     let targets = expand_process_targets(&pids, snapshot.as_ref());
 
     #[cfg(windows)]
-    let targets = expand_process_targets(&pids);
+    let windows_snapshot = read_windows_processes(false).map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    let close_plan = windows_close::plan_close(&pids, &windows_snapshot, std::process::id())?;
+    #[cfg(windows)]
+    windows_close::ensure_independent_lifetime(&close_plan, &windows_snapshot, std::process::id())?;
+    #[cfg(windows)]
+    let targets: Vec<u32> = close_plan
+        .iter()
+        .map(|process| process.process_id)
+        .collect();
+    #[cfg(windows)]
+    record_close_plan(&close_plan)?;
+
+    // Arm an independent recovery helper before the first destructive action.
+    // Failure leaves the existing desktop and credentials untouched.
+    let mut recovery = if reopen_desktop {
+        desktop_reopen::prepare_recovery(&desktops)?
+    } else {
+        None
+    };
 
     #[cfg(target_os = "macos")]
     let current_uid = current_unix_uid();
@@ -160,12 +192,22 @@ fn close_codex_processes_blocking(
             .collect::<HashSet<_>>()
     };
 
+    if let Some(recovery) = recovery.as_mut() {
+        recovery.close_started();
+    }
+
     #[cfg(target_os = "macos")]
     if !force_close && !desktop_processes.is_empty() {
         let _ = request_macos_codex_quit();
     }
 
     for pid in targets.iter().copied() {
+        // Send a graceful request to the desktop root first. Console helpers
+        // are cleaned up only after every desktop accepted that request.
+        #[cfg(windows)]
+        if !force_close && !pids.contains(&pid) {
+            continue;
+        }
         #[cfg(target_os = "macos")]
         if !force_close && desktop_processes.contains(&pid) {
             continue;
@@ -182,7 +224,14 @@ fn close_codex_processes_blocking(
             continue;
         }
 
-        if close_process(pid, force_close) {
+        #[cfg(windows)]
+        let closed = close_plan
+            .iter()
+            .find(|process| process.process_id == pid)
+            .is_some_and(|process| close_windows_process(process, force_close));
+        #[cfg(not(windows))]
+        let closed = close_process(pid, force_close);
+        if closed {
             killed_pids.push(pid);
         } else {
             failed_pids.push(pid);
@@ -216,6 +265,16 @@ fn close_codex_processes_blocking(
     }
 
     if !force_close {
+        #[cfg(windows)]
+        {
+            wait_for_processes_to_exit(&pids, Duration::from_secs(8));
+            if pids.iter().all(|pid| !process_exists(*pid)) {
+                for process in close_plan.iter().filter(|p| !pids.contains(&p.process_id)) {
+                    let _ = close_windows_process(process, true);
+                }
+            }
+        }
+        #[cfg(not(windows))]
         wait_for_processes_to_exit(&targets, Duration::from_secs(8));
         killed_pids = targets
             .iter()
@@ -229,7 +288,7 @@ fn close_codex_processes_blocking(
             .collect();
     }
 
-    let reopen_token = desktop_reopen::remember_closed_desktops(desktops, &killed_pids);
+    let reopen_token = desktop_reopen::remember_closed_desktops(desktops, &killed_pids, recovery);
     Ok(KillCodexProcessesResult {
         targeted_count,
         killed_pids,
@@ -270,11 +329,6 @@ fn expand_process_targets(root_pids: &[u32], snapshot: Option<&UnixProcessSnapsh
     }
 
     targets
-}
-
-#[cfg(windows)]
-fn expand_process_targets(root_pids: &[u32]) -> Vec<u32> {
-    root_pids.to_vec()
 }
 
 #[cfg(unix)]
@@ -320,6 +374,7 @@ fn read_unix_process_snapshot() -> Option<UnixProcessSnapshot> {
     })
 }
 
+#[cfg(not(windows))]
 fn close_process(pid: u32, force: bool) -> bool {
     #[cfg(unix)]
     {
@@ -332,23 +387,74 @@ fn close_process(pid: u32, force: bool) -> bool {
         return killed || !process_exists(pid);
     }
 
-    #[cfg(windows)]
-    {
-        let mut command = Command::new("taskkill");
-        command.creation_flags(CREATE_NO_WINDOW);
-        if force {
-            command.arg("/F");
+    #[allow(unreachable_code)]
+    false
+}
+
+#[cfg(windows)]
+fn close_windows_process(process: &WindowsCodexProcess, force: bool) -> bool {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, STILL_ACTIVE},
+        System::Threading::{
+            GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW,
+            PROCESS_QUERY_LIMITED_INFORMATION,
+        },
+    };
+    if process.process_id == std::process::id() {
+        return false;
+    }
+    // Keep a handle to the planned process while issuing a PID-only close and
+    // verify its executable. A missing or changed target is never broadened.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process.process_id);
+        if handle.is_null() {
+            return !process_exists(process.process_id);
         }
-        let killed = command
-            .args(["/T", "/PID", &pid.to_string()])
+        let mut code = 0;
+        let mut path = vec![0u16; 32768];
+        let mut length = path.len() as u32;
+        let readable = GetExitCodeProcess(handle, &mut code) != 0;
+        if readable && code != STILL_ACTIVE as u32 {
+            CloseHandle(handle);
+            return true;
+        }
+        let same = readable
+            && QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut length) != 0
+            && normalize_windows_path(&String::from_utf16_lossy(&path[..length as usize]))
+                == normalize_windows_path(&process.executable_path);
+        if !same {
+            CloseHandle(handle);
+            return false;
+        }
+        let killed = Command::new("taskkill")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(windows_close::taskkill_args(process.process_id, force))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        return killed || !process_exists(pid);
+        CloseHandle(handle);
+        killed || !process_exists(process.process_id)
     }
+}
 
-    #[allow(unreachable_code)]
-    false
+#[cfg(windows)]
+fn record_close_plan(processes: &[WindowsCodexProcess]) -> Result<(), String> {
+    // Store only PID/name metadata so a future exit can be traced without
+    // saving command lines, task arguments, or credentials.
+    let path = crate::auth::get_config_dir()
+        .map_err(|e| e.to_string())?
+        .join("last-codex-close.json");
+    let body = serde_json::json!({
+        "planned_at": chrono::Utc::now(),
+        "switcher_pid": std::process::id(),
+        "recursive_tree_kill": false,
+        "targets": processes.iter().map(|p| serde_json::json!({"pid":p.process_id,"name":p.name})).collect::<Vec<_>>()
+    });
+    crate::auth::persistence::atomic_write(
+        &path,
+        &serde_json::to_vec_pretty(&body).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -442,7 +548,7 @@ fn process_exists(pid: u32) -> bool {
 }
 
 /// Find all running codex processes. Returns (active_pids, background_count)
-fn find_codex_processes() -> anyhow::Result<(Vec<u32>, usize)> {
+pub(crate) fn find_codex_processes() -> anyhow::Result<(Vec<u32>, usize)> {
     #[cfg(unix)]
     {
         let mut pids = Vec::new();
@@ -632,6 +738,11 @@ fn find_windows_codex_processes() -> anyhow::Result<(Vec<u32>, usize)> {
 
 #[cfg(windows)]
 fn read_windows_codex_processes() -> anyhow::Result<Vec<WindowsCodexProcess>> {
+    read_windows_processes(true)
+}
+
+#[cfg(windows)]
+fn read_windows_processes(codex_only: bool) -> anyhow::Result<Vec<WindowsCodexProcess>> {
     // tasklist counts every Electron helper (`--type=gpu-process`, crashpad, renderer, etc.),
     // which inflates the badge and incorrectly blocks switching. Use PowerShell so we can inspect
     // the command line and only count live top-level app instances.
@@ -642,7 +753,7 @@ Get-Process -Name Codex,ChatGPT -ErrorAction SilentlyContinue | ForEach-Object {
 }
 
 Get-CimInstance Win32_Process |
-  Where-Object { $_.Name -ieq 'Codex.exe' -or $_.Name -ieq 'ChatGPT.exe' } |
+  Where-Object { $env:CODEX_SWITCHER_QUERY_ALL -eq '1' -or $_.Name -ieq 'Codex.exe' -or $_.Name -ieq 'ChatGPT.exe' } |
   ForEach-Object {
     [PSCustomObject]@{
       Name = $_.Name
@@ -668,6 +779,10 @@ Get-CimInstance Win32_Process |
             "-Command",
             POWERSHELL_SCRIPT,
         ])
+        .env(
+            "CODEX_SWITCHER_QUERY_ALL",
+            if codex_only { "0" } else { "1" },
+        )
         .output()
         .context("failed to query Windows process list")?;
 
@@ -1265,11 +1380,28 @@ fn is_windows_openai_codex_bin(path: &std::path::Path) -> bool {
 #[cfg(windows)]
 fn spawn_windows_codex_exe(path: &std::path::Path) -> bool {
     let mut command = Command::new(path);
-    command.creation_flags(CREATE_NO_WINDOW);
     if let Some(parent) = path.parent() {
         command.current_dir(parent);
     }
-    command.spawn().is_ok()
+    spawn_windows_process_with_breakaway(&mut command).is_ok()
+}
+
+#[cfg(windows)]
+fn spawn_windows_process_with_breakaway(
+    command: &mut Command,
+) -> std::io::Result<std::process::Child> {
+    use std::process::Stdio;
+    use windows_sys::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB;
+    // CREATE_NO_WINDOW only hides a console; it does not detach a Windows job.
+    // A successful request does not prove freedom from every enclosing job.
+    // Normal desktops can belong to unrelated jobs; membership alone is not a
+    // reason to reject them. Preserve startup errors before closing anything.
+    command
+        .creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
 }
 
 #[cfg(windows)]

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, useRef } from "react";
 import type { AccountInfo, AccountUsageStats, DockDisplayMode, UsageInfo } from "./types";
 import { invokeBackend, isTauriRuntime } from "./lib/platform";
 import {
@@ -125,6 +125,7 @@ function retainUsageForAccounts(
 }
 
 function TrayMenu() {
+  const generation = useRef(0);
   const [accounts, setAccounts] = useState<AccountInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [switchingId, setSwitchingId] = useState<string | null>(null);
@@ -219,26 +220,30 @@ function TrayMenu() {
   }, []);
 
   const load = useCallback(async () => {
+    const current = ++generation.current;
     try {
       void loadDockDisplayMode();
       const list = await invokeBackend<AccountInfo[]>("list_accounts");
+      if (current !== generation.current) return;
       setAccounts(list);
       setUsageById((prev) => retainUsageForAccounts(prev, list));
       setError(null);
       void loadUsage(list); // Don't block the list render on the usage calls.
       void loadActiveStats(list);
     } catch (err) {
-      setError(formatError(err));
+      if (current === generation.current) { setError(formatError(err)); setAccounts((prev) => prev.map((a) => ({ ...a, is_active: false }))); }
     } finally {
-      setLoading(false);
+      if (current === generation.current) setLoading(false);
     }
   }, [loadActiveStats, loadDockDisplayMode, loadUsage]);
 
   // Manual refresh: re-pull accounts and actively fetch fresh usage once.
   const handleRefresh = useCallback(async () => {
+    const current = ++generation.current;
     setRefreshing(true);
     try {
       const list = await invokeBackend<AccountInfo[]>("list_accounts");
+      if (current !== generation.current) return;
       setAccounts(list);
       setUsageById((prev) => retainUsageForAccounts(prev, list));
       setError(null);
@@ -322,7 +327,7 @@ function TrayMenu() {
   }, [load]);
 
   const handleSwitch = useCallback(async (account: AccountInfo) => {
-    if (account.is_active) {
+    if (account.is_active && !account.auth_sync_pending) {
       void invokeBackend("hide_tray_window");
       return;
     }
@@ -359,7 +364,7 @@ function TrayMenu() {
         <div className="flex h-6 w-6 items-center justify-center rounded-md bg-black text-xs font-bold text-white">
           C
         </div>
-        <span className="text-sm font-semibold">Codex Switcher</span>
+        <span className="text-sm font-semibold" title="체크 표시는 auth.json에 적용된 계정입니다. 실행 중인 앱의 로그인 상태는 별도입니다.">Codex Switcher · 인증 파일</span>
         <button
           onClick={() => void handleAutoWarmupToggle()}
           disabled={accounts.length === 0}
@@ -451,7 +456,7 @@ function TrayMenu() {
                 <span className="min-w-0 flex-1">
                   <span className="flex items-center gap-1.5">
                     <span className="min-w-0 flex-1 truncate text-sm font-medium">
-                      {account.name}
+                      {account.name}{account.auth_sync_pending ? " · 적용 대기" : ""}
                     </span>
                     {plan && (
                       <span className="shrink-0 rounded bg-gray-200 px-1.5 py-0.5 text-[10px] font-medium text-gray-700 dark:bg-gray-700 dark:text-gray-200">

@@ -111,7 +111,9 @@ mod tests {
             without_appmenu_module(OsStr::from_bytes(
                 b"/opt/\xff/other.so:appmenu-gtk-module:atk-bridge"
             )),
-            Some(OsString::from_vec(b"/opt/\xff/other.so:atk-bridge".to_vec()))
+            Some(OsString::from_vec(
+                b"/opt/\xff/other.so:atk-bridge".to_vec()
+            ))
         );
         assert_eq!(
             without_appmenu_module(OsStr::from_bytes(b"/opt/\xff/other.so")),

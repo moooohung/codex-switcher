@@ -1,6 +1,6 @@
 [package]
 name = "codex-switcher"
-version = "0.2.20"
+version = "0.2.21"
 description = "A multi-account manager for Codex CLI"
 authors = ["lampese"]
 edition = "2021"
@@ -14,39 +14,40 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2.10", features = ["tray-icon", "macos-private-api"] }
+tauri = { version = "=2.12.2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-opener = "2"
-tauri-plugin-dialog = "2.6"
+tauri-plugin-dialog = "=2.8.1"
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2.10"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json"] }
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+tokio = { version = "=1.53.2", features = ["full"] }
+reqwest = { version = "=0.13.5", features = ["json", "form", "query", "stream"] }
+chrono = { version = "=0.4.45", features = ["serde"] }
+uuid = { version = "=1.27.0", features = ["v4", "serde"] }
 dirs = "6"
-tiny_http = "0.12"
+tiny_http = "=0.12.0"
 webbrowser = "1"
-base64 = "0.22"
-sha2 = "0.10"
+base64 = "=0.23.1"
+# pbkdf2 0.12's backup KDF requires digest 0.10; sha2 0.11 uses digest 0.11.
+sha2 = "=0.10.9"
 rand = "0.9"
 thiserror = "2"
-anyhow = "1"
+anyhow = "=1.0.104"
 urlencoding = "2"
-futures = "0.3"
+futures = "=0.3.34"
 url = "2"
 flate2 = "1"
 chacha20poly1305 = "0.10"
 pbkdf2 = "0.12"
+tauri-plugin-single-instance = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Registry", "Win32_System_Threading"] }
+# Existing Windows consoles cannot expose a VT input pipe after launch; the
+# targeted console compatibility API is needed for already-running Claude TUIs.
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Registry", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
 
-[patch.crates-io]
-# Temporary backport of tray-icon PR #365: macOS 27 can swallow left-clicks while an NSMenu stays attached.
-# Remove this entry and vendor/tray-icon-0.21.3 once Tauri resolves to tray-icon >= 0.25.1 (or another release containing that fix), then refresh Cargo.lock.
-tray-icon = { path = "vendor/tray-icon-0.21.3" }
+# Tauri 2.12.2 resolves tray-icon 0.25.1, which includes the former macOS click fix.

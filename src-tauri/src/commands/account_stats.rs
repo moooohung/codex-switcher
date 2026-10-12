@@ -219,7 +219,9 @@ async fn fetch_profile_usage(account: &StoredAccount) -> anyhow::Result<AccountU
 
 async fn send_profile_usage_request(account: &StoredAccount) -> anyhow::Result<reqwest::Response> {
     let (access_token, chatgpt_account_id) = extract_chatgpt_auth(account)?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
 
     Ok(client
         .get(CHATGPT_PROFILE_USAGE_URL)
@@ -259,7 +261,9 @@ async fn parse_profile_usage_response(
 
 async fn fetch_reset_credits(account: &StoredAccount) -> anyhow::Result<AccountResetCredits> {
     let (access_token, chatgpt_account_id) = extract_chatgpt_auth(account)?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
     let response = client
         .get(CHATGPT_RESET_CREDITS_URL)
         .headers(build_reset_credits_headers(

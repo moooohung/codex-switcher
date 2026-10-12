@@ -40,16 +40,16 @@ pub fn switch_to_account(account: &StoredAccount) -> Result<()> {
     let content =
         serde_json::to_string_pretty(&auth_json).context("Failed to serialize auth.json")?;
 
-    fs::write(&auth_path, content)
-        .with_context(|| format!("Failed to write auth.json: {}", auth_path.display()))?;
-
-    // Set restrictive permissions on Unix
-    #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&auth_path, perms)?;
+        let _guard = super::persistence::lock_file(&codex_home.join("auth.lock"))?;
+        super::persistence::atomic_write(&auth_path, content.as_bytes())?;
+        let verified = super::persistence::read_json::<AuthDotJson>(&auth_path)?
+            .context("Credential write was not readable")?;
+        if !super::storage::credentials_match_auth(account, &verified) {
+            anyhow::bail!("Credential verification failed after switching");
+        }
     }
+    super::storage::mark_auth_synced(account)?;
 
     Ok(())
 }
@@ -123,17 +123,8 @@ pub fn import_from_auth_json_contents(
 pub fn read_current_auth() -> Result<Option<AuthDotJson>> {
     let path = get_codex_auth_file()?;
 
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read auth.json: {}", path.display()))?;
-
-    let auth: AuthDotJson = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse auth.json: {}", path.display()))?;
-
-    Ok(Some(auth))
+    let _guard = super::persistence::lock_file(&get_codex_home()?.join("auth.lock"))?;
+    super::persistence::read_json(&path)
 }
 
 /// Check if there is an active Codex login

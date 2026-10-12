@@ -2,7 +2,15 @@
   <img src="src-tauri/icons/logo.svg" alt="Codex Switcher" width="128" height="128">
 </p>
 
-<h1 align="center">Codex Switcher</h1>
+<h1 align="center">Codex Switcher — Codex + Claude Code fork</h1>
+
+This edition is maintained at [moooohung/codex-switcher](https://github.com/moooohung/codex-switcher), forked from [Lampese/codex-switcher](https://github.com/Lampese/codex-switcher). Original project attribution and third-party notices are retained.
+
+It adds an independent Claude Code provider with profile-scoped quota polling, account switching, warmup, encrypted backup, and matching account cards. Optional cache maintenance and Windows Remote Control reconnection are documented in [cache maintenance](docs/prompt-cache-keepalive.md) and [Remote Control](docs/claude-remote-control.md).
+
+Inactive accounts use their own saved OAuth credentials for quota polling. Cache preferences can be saved before a session is connected. Missing quota windows remain unknown; stale or revoked credentials do not become spare quota. A revoked refresh token still requires official sign-in. Settings, runtime registration, a confirmed connection and measured cache hits are displayed separately.
+
+The fork disables the upstream in-app updater so an upstream package cannot replace these changes. Releases are available from this fork after a tagged build; a new source commit does not imply that a release artifact or every platform has been verified. Dependency update automation remains enabled.
 
 <p align="center">
   A Desktop Application for Managing Multiple OpenAI <a href="https://github.com/openai/codex">Codex</a> Accounts<br>
@@ -35,7 +43,7 @@
 
 The easiest way to install Codex Switcher is from the latest GitHub release:
 
-[Download the latest release](https://github.com/Lampese/codex-switcher/releases/latest)
+[Download the latest fork release](https://github.com/moooohung/codex-switcher/releases/latest)
 
 Choose the file for your platform:
 
@@ -56,9 +64,8 @@ Choose the file for your platform:
 
 ### Auto Updates
 
-Codex Switcher checks the latest GitHub release on startup. When a newer signed
-update package is available, the app shows an update prompt and can install it
-from inside the app.
+This fork uses manual updates from its own releases. In-app updates are disabled
+until the fork has its own verified signing and update infrastructure.
 
 ### Build from Source
 

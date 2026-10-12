@@ -3,6 +3,7 @@ import { useAccounts } from "./hooks/useAccounts";
 import { useDesktopReopen } from "./hooks/useDesktopReopen";
 import { useCodexClosePreference } from "./hooks/useCodexClosePreference";
 import { SettingsModal } from "./components/SettingsModal";
+import { AutoSwitchStatus } from "./components/AutoSwitchStatus";
 import { finishForceClose, type DesktopReopenPreference } from "./lib/desktopReopen";
 import type { CodexClosePreference } from "./lib/codexClosePreference";
 import { useForceCloseCodexProcesses } from "./hooks/useForceCloseCodexProcesses";
@@ -42,6 +43,7 @@ import {
   type AutoWarmupWindowKind,
 } from "./lib/autoWarmupPolicy";
 import { getTauriWindow } from "./lib/tauriWindow";
+import { BackupPasswordDialog, requestBackupPassword } from "./components/BackupPasswordDialog";
 import "./App.css";
 
 const AUTO_WARMUP_CHECK_INTERVAL_MS = 30 * 1000;
@@ -528,7 +530,7 @@ function App() {
 
     const syncMaximizedState = async () => {
       try {
-        setIsWindowMaximized(await appWindow.isMaximized());
+        setIsWindowMaximized((await appWindow?.isMaximized()) ?? false);
       } catch (err) {
         console.error("Failed to read window state:", err);
       }
@@ -700,7 +702,7 @@ function App() {
               setSwitchingId(accountId);
               await switchAccount(accountId);
               setPendingSwitchAccountId(null);
-              showWarmupToast("Switched account from tray.");
+              showWarmupToast("인증 파일 계정을 변경했습니다.");
             } catch (err) {
               console.error("Failed to retry tray account switch:", err);
               showWarmupToast(`Switch failed: ${formatWarmupError(err)}`, true);
@@ -790,21 +792,16 @@ function App() {
           await switchAccount(accountId);
           showWarmupToast(`Switched account after ${codexClose.forceClose ? "force closing" : "closing"} Codex.`);
         } : null,
-        async (token) => {
-          try {
-            await invokeBackend("reopen_closed_codex_desktop", { token });
-            showWarmupToast(accountId ? "Account switched. Codex desktop reopened." : "Codex desktop reopened.");
-          } catch (err) {
-            showWarmupToast(`Codex closed${accountId ? " and account switched" : ""}, but reopening failed: ${formatWarmupError(err)}`, true);
-          }
-        },
+        async (token) => { await invokeBackend("reopen_closed_codex_desktop", { token }); },
       );
+      if (result.reopenToken) showWarmupToast(accountId ? "인증 파일 변경 완료. Codex 데스크톱 재실행 완료. 앱 내부 계정은 미확인입니다." : "Codex desktop reopened.");
       if (shouldReopen && !result.reopenToken) {
         showWarmupToast("No closed desktop app could be identified for reopening. Open Codex manually.", true);
       }
     } catch (err) {
       console.error("Failed to switch account after closing Codex:", err);
-      showWarmupToast(`Switch failed after closing Codex: ${formatWarmupError(err)}`, true);
+      void loadAccounts(true);
+      showWarmupToast(`전환 또는 데스크톱 재실행 실패: ${formatWarmupError(err)}`, true);
     } finally {
       setPendingSwitchAccountId(null);
       setSwitchingId(null);
@@ -1187,7 +1184,9 @@ function App() {
   const handleExportFullFile = async () => {
     try {
       setIsExportingFull(true);
-      const exported = await exportFullBackupFile();
+      const password = await requestBackupPassword("export");
+      if (password === null) return;
+      const exported = await exportFullBackupFile(password);
       if (!exported) return;
       showWarmupToast("Full encrypted file exported.");
     } catch (err) {
@@ -1201,7 +1200,9 @@ function App() {
   const handleImportFullFile = async () => {
     try {
       setIsImportingFull(true);
-      const summary = await importFullBackupFile();
+      const password = await requestBackupPassword("import");
+      if (password === null) return;
+      const summary = await importFullBackupFile(password);
       if (!summary) return;
       const accountList = await loadAccounts();
       await refreshUsage(accountList);
@@ -1217,6 +1218,21 @@ function App() {
       setIsImportingFull(false);
     }
   };
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let disposed = false;
+    const subscriptions: Array<() => void> = [];
+    void import("@tauri-apps/api/event").then(async ({ listen }) => {
+      const add = (stop: () => void) => { if (disposed) stop(); else subscriptions.push(stop); };
+      add(await listen<{ from: string; to: string; desktop_status: string; warning: string | null }>("auto-switched", ({ payload }) => {
+        void loadAccounts(true); void checkProcesses();
+        showWarmupToast(payload.warning ? `인증 파일 변경 완료. 재실행 실패: ${payload.warning}` : `인증 파일 변경 완료. 데스크톱: ${payload.desktop_status}`, !!payload.warning);
+      }));
+      add(await listen<string>("auto-switch-failed", ({ payload }) => { void loadAccounts(true); showWarmupToast(`자동 전환 실패: ${payload}`, true); }));
+    }).catch(console.error);
+    return () => { disposed = true; subscriptions.forEach((stop) => stop()); };
+  }, [loadAccounts, checkProcesses, showWarmupToast]);
 
   const handleOpenCodexApp = async () => {
     try {
@@ -1404,6 +1420,12 @@ function App() {
         </div>
 
         <div className="max-w-5xl mx-auto px-6 py-4">
+          <div className="mb-3 rounded-lg border border-gray-200 dark:border-gray-700 px-3 py-2 text-sm" role="status">
+            <span>인증 파일 계정: {activeAccount ? (maskedAccounts.has(activeAccount.id) ? "숨김" : activeAccount.name) : "확인할 수 없음"}</span>
+            {activeAccount?.auth_sync_pending && <span className="ml-3 text-amber-600">갱신된 인증 정보 적용 대기 · 다시 적용을 눌러 주세요</span>}
+            <span className="ml-3 text-gray-500">{hasRunningProcesses ? "Codex 실행 중 · 앱 내부 로그인 계정 미확인" : "Codex 실행 여부와 인증 파일을 각각 확인합니다."}</span>
+            <AutoSwitchStatus />
+          </div>
           <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_max-content] md:items-center md:gap-4">
             <div className="flex items-center gap-3 min-w-0 flex-1">
               <div className="min-w-0">
@@ -1821,7 +1843,7 @@ function App() {
               matchesAccountSearch(activeAccount, normalizedAccountSearchQuery) && (
                 <section>
                   <h2 className="text-sm font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-4">
-                    Active Account
+                    인증 파일에 적용된 계정
                   </h2>
                   <AccountCard
                     account={activeAccount}
@@ -2152,6 +2174,7 @@ function App() {
         </div>
       )}
 
+      <BackupPasswordDialog />
       {/* Add Account Modal */}
       <AddAccountModal
         isOpen={isAddModalOpen}
@@ -2159,6 +2182,7 @@ function App() {
         onImportFile={importFromFile}
         onStartOAuth={startOAuthLogin}
         onCompleteOAuth={completeOAuthLogin}
+        onOAuthAdded={handleSwitch}
         onCancelOAuth={cancelOAuthLogin}
       />
 

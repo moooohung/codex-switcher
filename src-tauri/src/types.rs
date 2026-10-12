@@ -40,6 +40,51 @@ fn default_close_behavior_prompt_enabled() -> bool {
     true
 }
 
+fn default_auto_switch_enabled() -> bool {
+    true
+}
+
+fn default_auto_switch_threshold_percent() -> f64 {
+    90.0
+}
+
+/// Only verified available quota can win; a preferred plan never bypasses it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPreference {
+    #[default]
+    Any,
+    Pro,
+    Plus,
+    Max,
+    Team,
+    Enterprise,
+    Education,
+    Free,
+}
+
+impl PlanPreference {
+    pub fn matches(self, plan: Option<&str>) -> bool {
+        let plan = plan
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .replace(['_', '-', ' '], "");
+        match self {
+            Self::Any => true,
+            Self::Pro => plan.starts_with("pro"),
+            Self::Plus => plan == "plus" || plan == "chatgptplus",
+            Self::Max => plan.starts_with("max"),
+            Self::Team => matches!(
+                plan.as_str(),
+                "team" | "business" | "chatgptteam" | "chatgptbusiness"
+            ),
+            Self::Enterprise => matches!(plan.as_str(), "enterprise" | "chatgptenterprise"),
+            Self::Education => matches!(plan.as_str(), "edu" | "education" | "chatgptedu"),
+            Self::Free => matches!(plan.as_str(), "free" | "chatgptfree"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -47,6 +92,11 @@ pub struct AppSettings {
     pub dock_display_mode: DockDisplayMode,
     #[serde(default = "default_close_behavior_prompt_enabled")]
     pub close_behavior_prompt_enabled: bool,
+    #[serde(default = "default_auto_switch_enabled")]
+    pub auto_switch_enabled: bool,
+    #[serde(default = "default_auto_switch_threshold_percent")]
+    pub auto_switch_threshold_percent: f64,
+    pub auto_switch_plan_preference: PlanPreference,
 }
 
 impl Default for AppSettings {
@@ -55,6 +105,9 @@ impl Default for AppSettings {
             tray_display_mode: TrayDisplayMode::default(),
             dock_display_mode: DockDisplayMode::default(),
             close_behavior_prompt_enabled: true,
+            auto_switch_enabled: true,
+            auto_switch_threshold_percent: 90.0,
+            auto_switch_plan_preference: PlanPreference::Any,
         }
     }
 }
@@ -88,6 +141,9 @@ pub struct StoredAccount {
     pub auth_mode: AuthMode,
     /// Authentication credentials
     pub auth_data: AuthData,
+    /// A newly rotated credential must not be overwritten by an older auth.json.
+    #[serde(default)]
+    pub auth_sync_pending: bool,
     /// When the account was added
     pub created_at: DateTime<Utc>,
     /// Last time this account was used
@@ -131,6 +187,7 @@ impl StoredAccount {
             subscription_expires_at: None,
             auth_mode: AuthMode::ApiKey,
             auth_data: AuthData::ApiKey { key: api_key },
+            auth_sync_pending: false,
             created_at: Utc::now(),
             last_used_at: None,
         }
@@ -161,6 +218,7 @@ impl StoredAccount {
                 refresh_token,
                 account_id,
             },
+            auth_sync_pending: false,
             created_at: Utc::now(),
             last_used_at: None,
         }
@@ -354,6 +412,8 @@ pub struct AccountInfo {
     pub subscription_expires_at: Option<DateTime<Utc>>,
     pub auth_mode: AuthMode,
     pub is_active: bool,
+    #[serde(default)]
+    pub auth_sync_pending: bool,
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
 }
@@ -370,6 +430,7 @@ impl AccountInfo {
             subscription_expires_at: None,
             auth_mode: account.auth_mode,
             is_active: active_id == Some(&account.id),
+            auth_sync_pending: account.auth_sync_pending,
             created_at: account.created_at,
             last_used_at: account.last_used_at,
         }

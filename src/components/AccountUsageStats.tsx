@@ -6,8 +6,10 @@ import type {
   UsageInfo,
 } from "../types";
 import { invokeBackend } from "../lib/platform";
+import { invokeClaude } from "../lib/claude";
 
 interface AccountUsageStatsProps {
+  provider?: "codex" | "claude";
   accountId: string;
   enabled: boolean;
   open: boolean;
@@ -343,6 +345,7 @@ function InvocationRow({ invocation }: { invocation: AccountTopInvocation }) {
 }
 
 export function AccountUsageStats({
+  provider = "codex",
   accountId,
   enabled,
   open,
@@ -360,7 +363,7 @@ export function AccountUsageStats({
     if (background && backgroundInFlight.current) return;
     const requestId = ++requestSeq.current;
 
-    if (!enabled) {
+    if (!enabled && provider !== "claude") {
       if (background) return;
       const next = emptyStats(accountId, "Usage stats are available for ChatGPT accounts only.");
       setStats(next);
@@ -375,9 +378,9 @@ export function AccountUsageStats({
       setLoading(true);
     }
     try {
-      const next = await invokeBackend<AccountUsageStatsInfo>("get_account_usage_stats", {
-        accountId,
-      });
+      const next = provider === "claude"
+        ? await invokeClaude<AccountUsageStatsInfo>("stats", { accountId })
+        : await invokeBackend<AccountUsageStatsInfo>("get_account_usage_stats", { accountId });
       if (requestId !== requestSeq.current) return;
       if (background && (!next.available || next.error)) return;
       setStats(next);
@@ -394,7 +397,7 @@ export function AccountUsageStats({
         setLoading(false);
       }
     }
-  }, [accountId, enabled, onStatsLoaded]);
+  }, [accountId, enabled, onStatsLoaded, provider]);
 
   useEffect(() => {
     requestSeq.current += 1;
@@ -402,6 +405,10 @@ export function AccountUsageStats({
     onStatsLoaded?.(null);
     setLoading(false);
   }, [accountId, onStatsLoaded]);
+
+  useEffect(() => {
+    if (provider === "claude" && enabled && open) void loadStats();
+  }, [accountId, enabled, open, provider, loadStats]);
 
   useEffect(() => {
     const usageChanged = usage !== lastObservedUsage.current;
@@ -423,7 +430,7 @@ export function AccountUsageStats({
       <div>
         <div className="mb-3 flex items-center justify-between gap-3">
           <p className="truncate text-[11px] text-gray-500 dark:text-gray-400">
-            {currentStats?.stats_as_of ? `Stats as of ${currentStats.stats_as_of}` : currentStats?.source ?? "ChatGPT backend"}
+            {provider === "claude" ? "Claude 연결 세션 관측 통계" : currentStats?.stats_as_of ? `Stats as of ${currentStats.stats_as_of}` : currentStats?.source ?? "ChatGPT backend"}
             {generatedAt && ` · updated ${generatedAt}`}
           </p>
           <button
@@ -445,7 +452,7 @@ export function AccountUsageStats({
         ) : currentStats?.available ? (
           <div className="space-y-3">
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
-              <StatTile label="Lifetime" value={formatTokens(currentStats.summary.lifetime_tokens)} sub="tokens" />
+              <StatTile label={provider === "claude" ? "Observed sessions" : "Lifetime"} value={formatTokens(currentStats.summary.lifetime_tokens)} sub="tokens" />
               <StatTile label="Today" value={formatTokens(todayTokens)} sub="reported" />
               <StatTile label="Last 7 days" value={formatTokens(sevenDayTokens)} sub="reported" />
               <StatTile label="Current streak" value={`${formatNumber(currentStats.summary.current_streak_days)} days`} />

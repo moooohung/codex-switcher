@@ -1,84 +1,116 @@
-//! OAuth login Tauri commands
-
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use tokio::sync::oneshot;
-
+//! OAuth adds credentials; switching uses the same guarded flow as other accounts.
 use crate::auth::oauth_server::{start_oauth_login, wait_for_oauth_login, OAuthLoginResult};
-use crate::auth::{
-    add_account, load_accounts, set_active_account, switch_to_account, touch_account,
-    AUTH_OPERATION_LOCK,
-};
+use crate::auth::{add_account, load_accounts};
 use crate::types::{AccountInfo, OAuthLoginInfo};
-
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
+};
+use tokio::sync::oneshot;
 struct PendingOAuth {
-    rx: oneshot::Receiver<anyhow::Result<OAuthLoginResult>>,
+    generation: u64,
+    rx: Option<oneshot::Receiver<anyhow::Result<OAuthLoginResult>>>,
     cancelled: Arc<AtomicBool>,
 }
-
-// Global state for pending OAuth login
 static PENDING_OAUTH: Mutex<Option<PendingOAuth>> = Mutex::new(None);
-
-/// Start the OAuth login flow
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 #[tauri::command]
 pub async fn start_login(account_name: String) -> Result<OAuthLoginInfo, String> {
-    // Cancel any previous pending flow so it does not keep the callback port occupied.
-    if let Some(previous) = {
+    let generation = {
         let mut pending = PENDING_OAUTH.lock().unwrap();
-        pending.take()
-    } {
-        previous.cancelled.store(true, Ordering::Relaxed);
-    }
-
+        if let Some(previous) = pending.take() {
+            previous.cancelled.store(true, Ordering::SeqCst);
+        }
+        GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+    };
     let (info, rx, cancelled) = start_oauth_login(account_name.trim().to_string())
         .await
         .map_err(|e| e.to_string())?;
-
-    // Store the receiver for later
-    {
-        let mut pending = PENDING_OAUTH.lock().unwrap();
-        *pending = Some(PendingOAuth { rx, cancelled });
+    let mut pending = PENDING_OAUTH.lock().unwrap();
+    if GENERATION.load(Ordering::SeqCst) != generation {
+        cancelled.store(true, Ordering::SeqCst);
+        return Err("OAuth login was cancelled".into());
     }
-
+    *pending = Some(PendingOAuth {
+        generation,
+        rx: Some(rx),
+        cancelled,
+    });
     Ok(info)
 }
-
-/// Wait for the OAuth login to complete and add the account
 #[tauri::command]
 pub async fn complete_login() -> Result<AccountInfo, String> {
-    let pending = {
-        let mut pending = PENDING_OAUTH.lock().unwrap();
-        pending
-            .take()
-            .ok_or_else(|| "No pending OAuth login".to_string())?
+    let (generation, rx, cancelled) = {
+        let mut guard = PENDING_OAUTH.lock().unwrap();
+        let pending = guard.as_mut().ok_or("No pending OAuth login")?;
+        (
+            pending.generation,
+            pending
+                .rx
+                .take()
+                .ok_or("OAuth completion already in progress")?,
+            pending.cancelled.clone(),
+        )
     };
-
-    let account = wait_for_oauth_login(pending.rx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let _auth_guard = AUTH_OPERATION_LOCK.lock().await;
-
-    // Add the account to storage
+    let result = wait_for_oauth_login(rx).await;
+    let mut pending = PENDING_OAUTH.lock().unwrap();
+    if cancelled.load(Ordering::SeqCst)
+        || !pending.as_ref().is_some_and(|p| p.generation == generation)
+    {
+        return Err("OAuth login was cancelled".into());
+    }
+    *pending = None;
+    let account = result.map_err(|e| e.to_string())?;
+    // Cancellation and commit share a mutex; cancelled flows cannot add accounts.
     let stored = add_account(account).map_err(|e| e.to_string())?;
-
-    // Make it active and switch to it
-    set_active_account(&stored.id).map_err(|e| e.to_string())?;
-    switch_to_account(&stored).map_err(|e| e.to_string())?;
-    touch_account(&stored.id).map_err(|e| e.to_string())?;
-
     let store = load_accounts().map_err(|e| e.to_string())?;
-    let active_id = store.active_account_id.as_deref();
-
-    Ok(AccountInfo::from_stored(&stored, active_id))
+    Ok(AccountInfo::from_stored(
+        &stored,
+        store.active_account_id.as_deref(),
+    ))
 }
-
-/// Cancel a pending OAuth login
 #[tauri::command]
 pub async fn cancel_login() -> Result<(), String> {
     let mut pending = PENDING_OAUTH.lock().unwrap();
-    if let Some(pending_oauth) = pending.take() {
-        pending_oauth.cancelled.store(true, Ordering::Relaxed);
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+    if let Some(flow) = pending.take() {
+        flow.cancelled.store(true, Ordering::SeqCst);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cancel_during_completion_rejects_a_late_success_without_touching_storage() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (tx, rx) = oneshot::channel();
+            let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+            let cancelled = Arc::new(AtomicBool::new(false));
+            *PENDING_OAUTH.lock().unwrap() = Some(PendingOAuth {
+                generation,
+                rx: Some(rx),
+                cancelled: cancelled.clone(),
+            });
+            let completion = tokio::spawn(complete_login());
+            loop {
+                if PENDING_OAUTH
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|p| p.rx.is_none())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            cancel_login().await.unwrap();
+            assert!(cancelled.load(Ordering::SeqCst));
+            let account =
+                crate::types::StoredAccount::new_api_key("late".into(), "synthetic".into());
+            assert!(tx.send(Ok(OAuthLoginResult { account })).is_ok());
+            assert!(completion.await.unwrap().unwrap_err().contains("cancelled"));
+        });
+    }
 }

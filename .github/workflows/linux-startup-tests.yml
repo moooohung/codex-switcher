@@ -12,11 +12,11 @@ jobs:
   linux-startup:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7.1.0
         with:
-          node-version: '22'
+          node-version: "26.11.1"
       - name: Test GTK module filtering
         run: |
           rustc --edition=2021 --test src-tauri/src/linux_gtk.rs -o "$RUNNER_TEMP/linux-gtk-tests"

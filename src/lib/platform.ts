@@ -1,5 +1,7 @@
 import type { ImportAccountsSummary } from "../types";
 
+export const WEB_TOKEN_KEY = "codex-switcher-web-token";
+
 export type FileSource = string | File;
 
 export function isTauriRuntime(): boolean {
@@ -17,10 +19,11 @@ export async function invokeBackend<T>(
 
   const response = await fetch(`/api/invoke/${command}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${sessionStorage.getItem(WEB_TOKEN_KEY) ?? ""}` },
     body: JSON.stringify(args ?? {}),
   });
 
+  if (response.status === 401) window.dispatchEvent(new Event("web-access-expired"));
   const payload = await readJsonResponse(response);
   if (!response.ok) {
     const message =
@@ -59,30 +62,33 @@ export async function pickAuthJsonFile(): Promise<FileSource | null> {
   return pickBrowserFile(".json,application/json");
 }
 
-export async function exportFullBackupFile(): Promise<boolean> {
+export async function exportFullBackupFile(passphrase: string, provider: "codex" | "claude" = "codex"): Promise<boolean> {
   if (isTauriRuntime()) {
     const { save } = await import("@tauri-apps/plugin-dialog");
     const selected = await save({
       title: "Export Full Encrypted Account Config",
-      defaultPath: "codex-switcher-full.cswf",
+      defaultPath: `${provider}-switcher-full.cswf`,
       filters: [{ name: "Codex Switcher Full Backup", extensions: ["cswf"] }],
     });
 
     if (!selected) return false;
-    await invokeBackend("export_accounts_full_encrypted_file", { path: selected });
+    if (provider === "claude") await invokeBackend("claude_command", { action: "export_encrypted_file", payload: { path: selected, passphrase } });
+    else await invokeBackend("export_accounts_full_encrypted_file", { path: selected, passphrase });
     return true;
   }
 
-  const contentsBase64 = await invokeBackend<string>("export_accounts_full_encrypted_bytes");
+  const contentsBase64 = provider === "claude"
+    ? await invokeBackend<string>("claude_command", { action: "export_encrypted", payload: { passphrase } })
+    : await invokeBackend<string>("export_accounts_full_encrypted_bytes", { passphrase });
   downloadBase64File(
     contentsBase64,
-    "codex-switcher-full.cswf",
+    `${provider}-switcher-full.cswf`,
     "application/octet-stream"
   );
   return true;
 }
 
-export async function importFullBackupFile(): Promise<ImportAccountsSummary | null> {
+export async function importFullBackupFile(passphrase: string, provider: "codex" | "claude" = "codex"): Promise<ImportAccountsSummary | null> {
   if (isTauriRuntime()) {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const selected = await open({
@@ -92,8 +98,10 @@ export async function importFullBackupFile(): Promise<ImportAccountsSummary | nu
     });
 
     if (!selected || Array.isArray(selected)) return null;
+    if (provider === "claude") return invokeBackend<ImportAccountsSummary>("claude_command", { action: "import_encrypted_file", payload: { path: selected, passphrase } });
     return invokeBackend<ImportAccountsSummary>("import_accounts_full_encrypted_file", {
       path: selected,
+      passphrase,
     });
   }
 
@@ -101,8 +109,10 @@ export async function importFullBackupFile(): Promise<ImportAccountsSummary | nu
   if (!selected) return null;
 
   const contentsBase64 = await fileToBase64(selected);
+  if (provider === "claude") return invokeBackend<ImportAccountsSummary>("claude_command", { action: "import_encrypted", payload: { contentsBase64, passphrase } });
   return invokeBackend<ImportAccountsSummary>("import_accounts_full_encrypted_bytes", {
     contentsBase64,
+    passphrase,
   });
 }
 

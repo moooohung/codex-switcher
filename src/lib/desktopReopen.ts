@@ -18,6 +18,15 @@ export async function finishForceClose(
   reopenDesktop: (token: string) => Promise<void>,
 ): Promise<void> {
   if (!outcome.canSwitch) return;
-  if (switchAccount) await switchAccount();
+  if (switchAccount) {
+    try { await switchAccount(); }
+    catch (error) {
+      if (outcome.reopenToken) {
+        try { await reopenDesktop(outcome.reopenToken); }
+        catch (reopenError) { throw new Error(`Switch failed: ${String(error)}; desktop recovery failed: ${String(reopenError)}`); }
+      }
+      throw error;
+    }
+  }
   if (outcome.reopenToken) await reopenDesktop(outcome.reopenToken);
 }

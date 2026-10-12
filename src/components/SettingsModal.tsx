@@ -3,11 +3,15 @@ import type { DesktopReopenPreference } from "../lib/desktopReopen";
 import type { CodexClosePreference } from "../lib/codexClosePreference";
 import { invokeBackend, isTauriRuntime } from "../lib/platform";
 import type { DockDisplayMode } from "../types";
+import { planPreferences, type PlanPreference } from "../lib/planPreference";
 
 type TrayDisplayMode = "icon_and_session" | "active_usage_text" | "hidden";
 interface DisplaySettings {
   tray_display_mode: TrayDisplayMode;
   dock_display_mode: DockDisplayMode | null;
+  auto_switch_enabled?: boolean;
+  auto_switch_threshold_percent?: number;
+  auto_switch_plan_preference?: PlanPreference;
 }
 
 interface SettingsModalProps {
@@ -81,6 +85,24 @@ export function SettingsModal({
     }
   };
 
+  const changeAutoSwitch = async (enabled: boolean, threshold: number, preference = displaySettings?.auto_switch_plan_preference ?? "any") => {
+    setSaving(true);
+    setError(null);
+    try {
+      await invokeBackend("set_auto_switch_settings", {
+        enabled,
+        thresholdPercent: threshold,
+        planPreference: preference,
+      });
+      await loadDisplaySettings();
+    } catch (err) {
+      requestId.current += 1;
+      setError(String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const selectClassName = "w-full rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 py-2 text-sm text-gray-900 dark:text-gray-100 disabled:opacity-50";
 
   return (
@@ -122,10 +144,65 @@ export function SettingsModal({
                       <p className="text-xs text-gray-500 dark:text-gray-400">At least one of the Dock or tray icons stays visible so you can reopen Codex Switcher.</p>
                     </>
                   )}
+                              <div className="border-t border-gray-100 dark:border-gray-800" />
+              <div className="flex items-center justify-between py-1">
+                <div>
+                  <label htmlFor="auto-switch-toggle" className="block text-sm font-medium text-gray-900 dark:text-gray-100 cursor-pointer">
+                    Auto-switch on low quota (자동 불판 교체)
+                  </label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400">
+                    5시간 또는 주간 할당량이 임계값에 도달하면 우선 등급의 사용 가능한 계정으로 자동 전환합니다.
+                  </p>
+                </div>
+                <input
+                  id="auto-switch-toggle"
+                  type="checkbox"
+                  checked={displaySettings.auto_switch_enabled ?? true}
+                  disabled={saving}
+                  onChange={(e) =>
+                    void changeAutoSwitch(
+                      e.target.checked,
+                      displaySettings.auto_switch_threshold_percent ?? 90
+                    )
+                  }
+                  className="w-4 h-4 rounded text-blue-600 focus:ring-blue-500 dark:focus:ring-blue-600 dark:ring-offset-gray-800 focus:ring-2 cursor-pointer"
+                />
+              </div>
+
+              <label htmlFor="auto-switch-plan" className="block text-sm font-medium text-gray-900 dark:text-gray-100">자동 전환 우선 등급</label>
+              <select id="auto-switch-plan" value={displaySettings.auto_switch_plan_preference ?? "any"} disabled={saving} className={selectClassName} onChange={(event) => void changeAutoSwitch(displaySettings.auto_switch_enabled ?? true, displaySettings.auto_switch_threshold_percent ?? 90, event.target.value as PlanPreference)}>
+                {planPreferences.codex.map(({ value, label }) => <option key={value} value={value}>{label}</option>)}
+              </select>
+              <p className="text-xs text-gray-500 dark:text-gray-400">우선 등급이 없거나 한도 소진·조회 실패이면 다른 등급을 사용합니다. 우선 계정의 사용량 조회는 최대 15초 기다립니다.</p>
+              {(displaySettings.auto_switch_enabled ?? true) && (
+                <>
+                  <label htmlFor="auto-switch-threshold" className="block text-sm font-medium text-gray-900 dark:text-gray-100">
+                    전환 임계값 (Switch threshold)
+                  </label>
+                  <select
+                    id="auto-switch-threshold"
+                    value={displaySettings.auto_switch_threshold_percent ?? 90}
+                    disabled={saving}
+                    onChange={(e) =>
+                      void changeAutoSwitch(
+                        displaySettings.auto_switch_enabled ?? true,
+                        Number(e.target.value)
+                      )
+                    }
+                    className={selectClassName}
+                  >
+                    <option value={80}>80% (20% 남았을 때 선제 전환)</option>
+                    <option value={85}>85% (15% 남았을 때 선제 전환)</option>
+                    <option value={90}>90% (10% 남았을 때 선제 전환, 권장)</option>
+                    <option value={95}>95% (5% 남았을 때 전환)</option>
+                    <option value={98}>98% (한도 직전 전환)</option>
+                  </select>
+                </>
+              )}
+              <div className="border-t border-gray-100 dark:border-gray-800" />
                 </>
               ) : !error && <p className="text-sm text-gray-500 dark:text-gray-400">Loading display settings...</p>}
               {error && <p role="alert" className="text-sm text-red-600 dark:text-red-300">Could not update display settings: {error}</p>}
-              <div className="border-t border-gray-100 dark:border-gray-800" />
             </>
           )}
           <label htmlFor="codex-close-preference" className="block text-sm font-medium text-gray-900 dark:text-gray-100">

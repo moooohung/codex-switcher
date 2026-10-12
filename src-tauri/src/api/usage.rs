@@ -11,7 +11,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-use crate::auth::{ensure_chatgpt_tokens_fresh, refresh_chatgpt_tokens};
+use crate::auth::{
+    chatgpt_account_for_usage, ensure_chatgpt_tokens_fresh, refresh_chatgpt_tokens,
+    refresh_chatgpt_tokens_for_usage,
+};
 use crate::types::{
     AuthData, CreditStatusDetails, RateLimitDetails, RateLimitStatusPayload, RateLimitWindow,
     StoredAccount, UsageInfo,
@@ -138,10 +141,14 @@ pub async fn fetch_chatgpt_account_metadata(
 }
 
 async fn get_usage_with_chatgpt_auth(account: &StoredAccount) -> Result<UsageInfo> {
-    let fresh_account = ensure_chatgpt_tokens_fresh(account).await?;
+    get_usage_with_chatgpt_auth_at(account, &format!("{CHATGPT_BACKEND_API}/wham/usage")).await
+}
+
+async fn get_usage_with_chatgpt_auth_at(account: &StoredAccount, url: &str) -> Result<UsageInfo> {
+    let fresh_account = chatgpt_account_for_usage(account)?;
     let (access_token, chatgpt_account_id) = extract_chatgpt_auth(&fresh_account)?;
 
-    let response = send_chatgpt_usage_request(access_token, chatgpt_account_id).await?;
+    let response = send_chatgpt_get_request(url, access_token, chatgpt_account_id).await?;
 
     // 401 means the token is genuinely expired — refresh and retry once.
     // 403 is a Cloudflare challenge or permissions error; refreshing the token
@@ -151,9 +158,9 @@ async fn get_usage_with_chatgpt_auth(account: &StoredAccount) -> Result<UsageInf
             "[Usage] Unauthorized for account {}, refreshing token and retrying once",
             fresh_account.name
         );
-        let refreshed_account = refresh_chatgpt_tokens(&fresh_account).await?;
+        let refreshed_account = refresh_chatgpt_tokens_for_usage(&fresh_account).await?;
         let (retry_token, retry_account_id) = extract_chatgpt_auth(&refreshed_account)?;
-        let retry_response = send_chatgpt_usage_request(retry_token, retry_account_id).await?;
+        let retry_response = send_chatgpt_get_request(url, retry_token, retry_account_id).await?;
         return parse_usage_response(
             &refreshed_account.id,
             &refreshed_account.name,
@@ -226,7 +233,9 @@ async fn warmup_with_chatgpt_auth(account: &StoredAccount) -> Result<()> {
 }
 
 async fn warmup_with_api_key(api_key: &str) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
     let payload = build_warmup_payload(false, true);
     let response = client
         .post(format!("{OPENAI_API}/responses"))
@@ -346,24 +355,14 @@ fn extract_chatgpt_auth(account: &StoredAccount) -> Result<(&str, Option<&str>)>
     }
 }
 
-async fn send_chatgpt_usage_request(
-    access_token: &str,
-    chatgpt_account_id: Option<&str>,
-) -> Result<reqwest::Response> {
-    send_chatgpt_get_request(
-        &format!("{CHATGPT_BACKEND_API}/wham/usage"),
-        access_token,
-        chatgpt_account_id,
-    )
-    .await
-}
-
 async fn send_chatgpt_get_request(
     url: &str,
     access_token: &str,
     chatgpt_account_id: Option<&str>,
 ) -> Result<reqwest::Response> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
     let headers = build_chatgpt_headers(access_token, chatgpt_account_id)?;
 
     client
@@ -379,7 +378,9 @@ async fn send_chatgpt_warmup_request(
     chatgpt_account_id: Option<&str>,
     stream: bool,
 ) -> Result<reqwest::Response> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
     let headers = build_chatgpt_headers(access_token, chatgpt_account_id)?;
     let payload = build_warmup_payload(stream, false);
 
@@ -390,6 +391,225 @@ async fn send_chatgpt_warmup_request(
         .send()
         .await
         .context("Failed to send ChatGPT warm-up request")
+}
+
+#[cfg(test)]
+mod usage_lock_regression {
+    use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct IsolatedHome {
+        path: std::path::PathBuf,
+        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+    impl IsolatedHome {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("switcher-usage-{}", uuid::Uuid::new_v4()));
+            let mut previous = Vec::new();
+            for (key, suffix) in [("CODEX_HOME", "codex"), ("CODEX_SWITCHER_HOME", "switcher")] {
+                previous.push((key, std::env::var_os(key)));
+                std::env::set_var(key, path.join(suffix));
+            }
+            Self { path, previous }
+        }
+    }
+    impl Drop for IsolatedHome {
+        fn drop(&mut self) {
+            for (key, value) in &self.previous {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn id_token(account: &str) -> String {
+        let json = serde_json::json!({"exp":1,"https://api.openai.com/auth":{"chatgpt_account_id":account}});
+        format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(json.to_string())
+        )
+    }
+
+    #[tokio::test]
+    async fn auth_contention_valid_tokens_do_not_join_the_mutation_queue() {
+        let _sandbox = IsolatedHome::new();
+        // Synthetic JWT with exp=4000000000; no OAuth or external request.
+        let token = "header.eyJleHAiOjQwMDAwMDAwMDB9.signature";
+        let account = crate::auth::add_account(StoredAccount::new_chatgpt(
+            "Synthetic".into(),
+            None,
+            None,
+            None,
+            token.into(),
+            token.into(),
+            "synthetic-refresh".into(),
+            Some("synthetic-workspace".into()),
+        ))
+        .unwrap();
+        crate::auth::switch_to_account(&account).unwrap();
+        let path = crate::auth::get_accounts_file().unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let _operation = crate::auth::AUTH_OPERATION_LOCK.lock().await;
+        let _file_operation = crate::auth::lock_auth_operations().await.unwrap();
+        let current = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            crate::auth::ensure_chatgpt_tokens_fresh(&account),
+        )
+        .await
+        .expect("valid tokens must not queue behind a manual switch or unrelated refresh")
+        .unwrap();
+        assert_eq!(current.id, account.id);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        // Codex may rotate tokens outside the Switcher's mutation gate. The
+        // fast path must still save that replacement, respecting pending sync.
+        let mut live = crate::auth::read_current_auth().unwrap().unwrap();
+        live.tokens.as_mut().unwrap().refresh_token = "native-rotated-refresh".into();
+        let live_path = crate::auth::get_codex_auth_file().unwrap();
+        crate::auth::persistence::atomic_write(&live_path, &serde_json::to_vec(&live).unwrap())
+            .unwrap();
+        let current = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            crate::auth::ensure_chatgpt_tokens_fresh(&account),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(crate::auth::credentials_match_auth(&current, &live));
+        assert!(crate::auth::credentials_match_auth(
+            &crate::auth::get_account(&account.id).unwrap().unwrap(),
+            &live
+        ));
+    }
+
+    #[tokio::test]
+    async fn exhausted_usage_does_not_wait_for_refresh_or_switch_locks() {
+        let _sandbox = IsolatedHome::new();
+        let account = crate::auth::add_account(StoredAccount::new_chatgpt(
+            "Synthetic Plus".into(),
+            None,
+            None,
+            None,
+            id_token("synthetic-plus"),
+            "synthetic-access".into(),
+            "synthetic-refresh".into(),
+            Some("synthetic-plus".into()),
+        ))
+        .unwrap();
+        crate::auth::switch_to_account(&account).unwrap();
+        let stored_before = std::fs::read(crate::auth::get_accounts_file().unwrap()).unwrap();
+        let auth_before = std::fs::read(crate::auth::get_codex_auth_file().unwrap()).unwrap();
+        // Both the desktop mutex and another process's file lock remain held.
+        let _operation = crate::auth::AUTH_OPERATION_LOCK.lock().await;
+        let _file_operation = crate::auth::lock_auth_operations().await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/usage", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let size = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..size]).to_lowercase();
+            assert!(request.contains("authorization: bearer synthetic-access"));
+            let body = r#"{"plan_type":"plus","rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"used_percent":100,"limit_window_seconds":18000},"secondary_window":{"used_percent":67,"limit_window_seconds":604800}}}"#;
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            get_usage_with_chatgpt_auth_at(&account, &url),
+        )
+        .await;
+        if result.is_err() {
+            server.abort();
+        }
+        let usage = result
+            .expect("quota detection must not wait behind token refresh or manual switch")
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(usage.primary_used_percent, Some(100.0));
+        assert_eq!(crate::auto_switch::quota_score(&usage).unwrap(), 100.0);
+        assert_eq!(
+            std::fs::read(crate::auth::get_accounts_file().unwrap()).unwrap(),
+            stored_before
+        );
+        assert_eq!(
+            std::fs::read(crate::auth::get_codex_auth_file().unwrap()).unwrap(),
+            auth_before
+        );
+        drop(_file_operation);
+        drop(_operation);
+        // Continue from the actual HTTP observation through the production
+        // policy into a verified credential-file write in this isolated home.
+        let pro = crate::auth::add_account(StoredAccount::new_chatgpt(
+            "Synthetic Pro".into(),
+            None,
+            None,
+            None,
+            id_token("synthetic-pro"),
+            "synthetic-pro-access".into(),
+            "synthetic-pro-refresh".into(),
+            Some("synthetic-pro".into()),
+        ))
+        .unwrap();
+        let pro_id = pro.id.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/usage", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let size = socket.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..size])
+                .to_lowercase()
+                .contains("authorization: bearer synthetic-pro-access"));
+            let body = r#"{"plan_type":"prolite","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":53,"limit_window_seconds":604800}}}"#;
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let result = crate::auto_switch::evaluate_rotation(
+            &account,
+            &[account.clone(), pro],
+            &usage,
+            98.0,
+            |candidate| {
+                let url = url.clone();
+                async move {
+                    get_usage_with_chatgpt_auth_at(&candidate, &url)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            },
+            |_, target| async move {
+                crate::auth::switch_to_account(&target).map_err(|e| e.to_string())?;
+                Ok(crate::commands::account::AutoSwitchOutcome {
+                    from: "Synthetic Plus".into(),
+                    to: target.name,
+                    desktop_status: "isolated_no_desktop".into(),
+                    warning: None,
+                })
+            },
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(matches!(
+            result,
+            crate::auto_switch::RotationResult::Switched(_)
+        ));
+        let store = crate::auth::load_accounts().unwrap();
+        assert_eq!(store.active_account_id, Some(pro_id.clone()));
+        assert!(crate::auth::credentials_match_auth(
+            store.accounts.iter().find(|a| a.id == pro_id).unwrap(),
+            &crate::auth::read_current_auth().unwrap().unwrap()
+        ));
+    }
 }
 
 fn log_warmup_response(source: &str, body: &str, is_sse: bool) {
@@ -417,9 +637,21 @@ fn truncate_text(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         return text.to_string();
     }
-    let mut out = text[..max_len].to_string();
+    let mut boundary = max_len;
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let mut out = text[..boundary].to_string();
     out.push_str("...");
     out
+}
+
+#[test]
+fn truncates_unicode_without_splitting_a_character() {
+    assert_eq!(truncate_text("한글🙂abc", 1), "...");
+    assert_eq!(truncate_text("한글🙂abc", 7), "한글...");
+    assert_eq!(truncate_text("éclair", 2), "é...");
+    assert_eq!(truncate_text("한글", 6), "한글");
 }
 
 fn extract_text_from_sse(body: &str) -> Option<String> {

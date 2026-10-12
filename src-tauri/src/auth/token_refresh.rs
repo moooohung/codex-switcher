@@ -6,8 +6,8 @@ use chrono::Utc;
 use tokio::time::{sleep, Duration};
 
 use super::{
-    load_accounts, read_current_auth, save_accounts, switch_to_account, sync_active_account_tokens,
-    update_account_chatgpt_tokens, AUTH_OPERATION_LOCK,
+    load_accounts, read_current_auth, switch_to_account, sync_active_account_tokens,
+    update_account_chatgpt_tokens, update_accounts,
 };
 use crate::types::{
     parse_chatgpt_id_token_claims, AccountsStore, AuthData, AuthDotJson, StoredAccount,
@@ -16,6 +16,21 @@ use crate::types::{
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const EXPIRY_SKEW_SECONDS: i64 = 60;
+
+/// Usage needs the access token, not a freshly issued ID token. Read the latest
+/// credentials without joining the refresh/switch queue or rotating tokens.
+/// A 401 from the usage endpoint still goes through the serialized refresh path.
+pub fn chatgpt_account_for_usage(account: &StoredAccount) -> Result<StoredAccount> {
+    let mut store = load_accounts()?;
+    if let Ok(Some(auth)) = read_current_auth() {
+        sync_active_account_tokens(&mut store, &auth);
+    }
+    store
+        .accounts
+        .into_iter()
+        .find(|stored| stored.id == account.id)
+        .context("Account not found")
+}
 
 #[derive(Debug, serde::Deserialize)]
 struct RefreshTokenResponse {
@@ -37,11 +52,20 @@ struct TokenRefreshUpdate {
 /// Ensure the account has non-expired ChatGPT OAuth tokens.
 /// Returns an updated account when a refresh was performed.
 pub async fn ensure_chatgpt_tokens_fresh(account: &StoredAccount) -> Result<StoredAccount> {
-    if !chatgpt_tokens_need_refresh(account) {
+    if matches!(account.auth_data, AuthData::ApiKey { .. }) {
         return Ok(account.clone());
     }
 
-    let _auth_guard = AUTH_OPERATION_LOCK.lock().await;
+    // Read the latest persisted/live credentials before joining the mutation
+    // queue. Metadata, profile and warm-up reads usually need no token rotation.
+    // The short accounts transaction preserves any native token rotation.
+    // Unchanged snapshots no longer write the account file or notify watchers.
+    let (current, _) = load_account_reconciling_live_auth(&account.id)?;
+    if !chatgpt_tokens_need_refresh(&current) {
+        return Ok(current);
+    }
+    let _auth_guard = super::lock_auth_operation("token_check", &account.id).await;
+    let _file_guard = super::lock_auth_operations().await?;
     ensure_chatgpt_tokens_fresh_locked(account).await
 }
 
@@ -79,8 +103,30 @@ pub async fn refresh_chatgpt_tokens(account: &StoredAccount) -> Result<StoredAcc
         return Ok(account.clone());
     }
 
-    let _auth_guard = AUTH_OPERATION_LOCK.lock().await;
+    let _auth_guard = super::lock_auth_operation("forced_refresh", &account.id).await;
+    let _file_guard = super::lock_auth_operations().await?;
     refresh_chatgpt_tokens_locked(account).await
+}
+
+/// A cancelled candidate lookup must not abandon a single-use token rotation.
+/// Detaching the owned refresh task lets it persist the replacement credentials.
+pub async fn refresh_chatgpt_tokens_for_usage(account: &StoredAccount) -> Result<StoredAccount> {
+    let requested = account.clone();
+    tokio::spawn(async move {
+        let _auth_guard = super::lock_auth_operation("usage_401", &requested.id).await;
+        let _file_guard = super::lock_auth_operations().await?;
+        let (current, _) = load_account_reconciling_live_auth(&requested.id)?;
+        let access = |account: &StoredAccount| match &account.auth_data {
+            AuthData::ChatGPT { access_token, .. } => Some(access_token.clone()),
+            _ => None,
+        };
+        // Another query may already have refreshed the failed access token.
+        if access(&current) != access(&requested) {
+            return Ok(current);
+        }
+        refresh_chatgpt_tokens_locked(&current).await
+    })
+    .await?
 }
 
 async fn refresh_chatgpt_tokens_locked(account: &StoredAccount) -> Result<StoredAccount> {
@@ -136,9 +182,9 @@ async fn refresh_chatgpt_tokens_locked(account: &StoredAccount) -> Result<Stored
     // Re-read active state after the network request before touching auth.json.
     let is_active = load_accounts()?.active_account_id.as_deref() == Some(account.id.as_str());
     if is_active {
-        if let Err(err) = switch_to_account(&updated) {
-            println!("[Auth] Failed to sync active auth.json after token refresh: {err}");
-        }
+        switch_to_account(&updated).context(
+            "Refreshed credentials were saved, but active auth.json could not be updated",
+        )?;
     }
 
     Ok(updated)
@@ -157,16 +203,13 @@ fn reconcile_active_account_from_auth(
 }
 
 fn load_account_reconciling_live_auth(account_id: &str) -> Result<(StoredAccount, bool)> {
-    let mut store = load_accounts()?;
-    let is_active = store.active_account_id.as_deref() == Some(account_id);
-
-    if is_active {
-        if let Some(auth) = read_current_auth()? {
-            if reconcile_active_account_from_auth(&mut store, account_id, &auth) {
-                save_accounts(&store)?;
-            }
+    let store = update_accounts(|store| {
+        if let Ok(Some(auth)) = read_current_auth() {
+            reconcile_active_account_from_auth(store, account_id, &auth);
         }
-    }
+        Ok(store.clone())
+    })?;
+    let is_active = store.active_account_id.as_deref() == Some(account_id);
 
     let account = store
         .accounts
@@ -287,7 +330,9 @@ fn parse_jwt_exp(token: &str) -> Option<i64> {
 }
 
 async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<RefreshTokenResponse> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
     let body = format!(
         "grant_type=refresh_token&refresh_token={}&client_id={}",
         urlencoding::encode(refresh_token),

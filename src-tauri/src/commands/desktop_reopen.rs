@@ -4,6 +4,9 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DesktopTarget {
     #[cfg(any(target_os = "macos", test))]
@@ -27,7 +30,278 @@ struct ReopenTicket {
     token: String,
     created_at: Instant,
     targets: Vec<DesktopTarget>,
+    recovery: Option<Recovery>,
 }
+
+pub(super) struct Recovery {
+    #[cfg(windows)]
+    directory: std::path::PathBuf,
+    #[cfg(windows)]
+    cancel_on_drop: bool,
+    #[cfg(windows)]
+    helper: Option<std::os::windows::io::OwnedHandle>,
+}
+
+#[cfg(windows)]
+#[derive(serde::Deserialize)]
+struct RecoveryReceipt {
+    pid: u32,
+    owner_pid: u32,
+    receipt_id: String,
+}
+
+impl Recovery {
+    pub(super) fn close_started(&mut self) {
+        // After the first destructive action, a poisoned mutex, replaced ticket
+        // or unwinding stack must not disarm the independent recovery helper.
+        #[cfg(windows)]
+        {
+            self.cancel_on_drop = false;
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Recovery {
+    fn drop(&mut self) {
+        if self.cancel_on_drop {
+            let _ = std::fs::write(self.directory.join("cancel"), b"");
+        }
+    }
+}
+
+// No credentials, account IDs or user command lines enter this recovery plan.
+#[cfg(windows)]
+fn recovery_target(target: &DesktopTarget) -> serde_json::Value {
+    match target {
+        DesktopTarget::WindowsExecutable(value) => serde_json::json!({"kind":"exe", "value":value}),
+        DesktopTarget::WindowsAppId(value) => serde_json::json!({"kind":"app", "value":value}),
+        #[cfg(test)]
+        _ => unreachable!("Windows recovery requires Windows desktops"),
+    }
+}
+
+pub(super) fn prepare_recovery(desktops: &[CapturedDesktop]) -> Result<Option<Recovery>, String> {
+    #[cfg(windows)]
+    if !desktops.is_empty() {
+        let directory = crate::auth::get_config_dir()
+            .map_err(|e| e.to_string())?
+            .join("desktop-recovery")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        let mut recovery = Recovery {
+            directory,
+            cancel_on_drop: true,
+            helper: None,
+        };
+        let receipt_id = recovery
+            .directory
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let plan = serde_json::json!({
+            "owner_pid": std::process::id(),
+            "receipt_id": receipt_id,
+            "desktops": desktops.iter().map(|desktop| serde_json::json!({
+                "pid": desktop.pid, "target": recovery_target(&desktop.target),
+            })).collect::<Vec<_>>(),
+        });
+        crate::auth::persistence::atomic_write(
+            &recovery.directory.join("plan.json"),
+            &serde_json::to_vec(&plan).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let script = recovery.directory.join("recover.ps1");
+        std::fs::write(&script, WINDOWS_RECOVERY_SCRIPT).map_err(|e| e.to_string())?;
+        // Ask the actual Explorer desktop to create the recovery process. A
+        // locally created Shell.Application alone may launch from this relay.
+        let shell = std::env::var_os("ProgramFiles")
+            .map(std::path::PathBuf::from)
+            .ok_or("ProgramFiles is unavailable; nothing was closed")?
+            .join("PowerShell/7/pwsh.exe");
+        let arguments = format!(
+            "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\" \"{}\"",
+            script.display(),
+            recovery.directory.display(),
+        );
+        let mut command = super::Command::new(&shell);
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Sta",
+                "-Command",
+                WINDOWS_DESKTOP_BROKER_SCRIPT,
+            ])
+            .env("CODEX_SWITCHER_RECOVERY_SHELL", &shell)
+            .env("CODEX_SWITCHER_RECOVERY_ARGUMENTS", arguments)
+            .env("CODEX_SWITCHER_RECOVERY_DIRECTORY", &recovery.directory)
+            .creation_flags(super::CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn().map_err(|e| {
+            format!("Could not start Explorer recovery relay; nothing was closed: {e}")
+        })?;
+        let started = Instant::now();
+        let mut relay_done = false;
+        loop {
+            if !relay_done {
+                if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                    if !status.success() {
+                        return Err(
+                            "Explorer desktop recovery broker failed; nothing was closed".into(),
+                        );
+                    }
+                    relay_done = true;
+                }
+            }
+            if relay_done {
+                if let Ok(bytes) = std::fs::read(recovery.directory.join("ready")) {
+                    let receipt: RecoveryReceipt = serde_json::from_slice(&bytes).map_err(|e| {
+                        format!("Invalid recovery receipt; nothing was closed: {e}")
+                    })?;
+                    if receipt.owner_pid != std::process::id()
+                        || receipt.receipt_id != receipt_id
+                        || receipt.pid == child.id()
+                        || receipt.pid == std::process::id()
+                    {
+                        return Err("Recovery receipt does not identify the owned Explorer helper; nothing was closed".into());
+                    }
+                    recovery.helper = Some(verify_recovery_helper(receipt.pid, &shell)?);
+                    return Ok(Some(recovery));
+                }
+            }
+            if started.elapsed() >= Duration::from_secs(5) {
+                return Err("Desktop recovery did not become ready; nothing was closed".into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = desktops;
+    Ok(None)
+}
+
+#[cfg(windows)]
+const WINDOWS_DESKTOP_BROKER_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+try {
+  $shell = New-Object -ComObject Shell.Application
+  $hwnd = 0
+  $desktop = $shell.Windows().FindWindowSW(0, 0, 8, [ref]$hwnd, 1)
+  if ($null -eq $desktop -or $null -eq $desktop.Document.Application) {
+    throw 'Explorer desktop automation is unavailable'
+  }
+  $desktop.Document.Application.ShellExecute($env:CODEX_SWITCHER_RECOVERY_SHELL,
+    $env:CODEX_SWITCHER_RECOVERY_ARGUMENTS, $env:CODEX_SWITCHER_RECOVERY_DIRECTORY, 'open', 0)
+} catch { exit 1 }
+"#;
+
+#[cfg(windows)]
+fn verify_recovery_helper(
+    pid: u32,
+    executable: &std::path::Path,
+) -> Result<std::os::windows::io::OwnedHandle, String> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::{
+        Foundation::STILL_ACTIVE,
+        System::Threading::{
+            GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW,
+            PROCESS_QUERY_LIMITED_INFORMATION,
+        },
+    };
+    unsafe {
+        let raw = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if raw.is_null() {
+            return Err("Could not open recovery helper; nothing was closed".into());
+        }
+        let handle = OwnedHandle::from_raw_handle(raw);
+        let mut code = 0;
+        let mut path = vec![0u16; 32768];
+        let mut length = path.len() as u32;
+        if GetExitCodeProcess(handle.as_raw_handle(), &mut code) == 0
+            || code != STILL_ACTIVE as u32
+            || QueryFullProcessImageNameW(handle.as_raw_handle(), 0, path.as_mut_ptr(), &mut length)
+                == 0
+            || super::normalize_windows_path(&String::from_utf16_lossy(&path[..length as usize]))
+                != super::normalize_windows_path(&executable.to_string_lossy())
+        {
+            return Err("Recovery helper identity or lifetime changed; nothing was closed".into());
+        }
+        // This is a check of our newly brokered helper, never of Switcher or
+        // arbitrary desktop jobs. Keep the handle so PID reuse cannot replace it.
+        if super::windows_close::process_is_in_job(handle.as_raw_handle())
+            .map_err(|e| format!("Could not inspect recovery helper; nothing was closed: {e}"))?
+        {
+            return Err("Explorer recovery helper remained in a job; nothing was closed".into());
+        }
+        Ok(handle)
+    }
+}
+
+#[cfg(windows)]
+const WINDOWS_RECOVERY_SCRIPT: &str = r#"
+param([string]$Directory)
+$ErrorActionPreference = 'Stop'
+function Write-Result([string]$Status, [string]$Message) {
+  @{ status = $Status; message = $Message } | ConvertTo-Json -Compress |
+    Set-Content -LiteralPath (Join-Path $Directory 'result.json') -Encoding utf8
+}
+try {
+  $plan = Get-Content -LiteralPath (Join-Path $Directory 'plan.json') -Raw | ConvertFrom-Json
+  $owner = [Diagnostics.Process]::GetProcessById([int]$plan.owner_pid)
+  $null = $owner.Handle # Retain original process identity across PID reuse.
+  $desktops = @($plan.desktops | ForEach-Object {
+    $process = $null
+    try { $process = [Diagnostics.Process]::GetProcessById([int]$_.pid); $null = $process.Handle }
+    catch { $process = $null }
+    @{ target = $_.target; process = $process }
+  })
+  $receipt = @{ pid = $PID; owner_pid = $plan.owner_pid; receipt_id = $plan.receipt_id } | ConvertTo-Json -Compress
+  [IO.File]::WriteAllText((Join-Path $Directory 'ready.staged'), $receipt)
+  Move-Item -LiteralPath (Join-Path $Directory 'ready.staged') -Destination (Join-Path $Directory 'ready')
+  $deadline = [DateTime]::UtcNow.AddSeconds(120)
+  $request = Join-Path $Directory 'reopen.json'
+  while ($true) {
+    if (Test-Path -LiteralPath (Join-Path $Directory 'cancel')) { exit 0 }
+    if (Test-Path -LiteralPath $request) {
+      $targets = @(Get-Content -LiteralPath $request -Raw | ConvertFrom-Json)
+      break
+    }
+    if ($owner.HasExited) { $targets = @($desktops | ForEach-Object { $_.target }); break }
+    if ([DateTime]::UtcNow -ge $deadline) { throw 'Desktop recovery request expired' }
+    Start-Sleep -Milliseconds 100
+  }
+  $launched = @{}
+  foreach ($target in $targets) {
+    $key = $target.kind + ':' + $target.value
+    if ($launched.ContainsKey($key)) { continue }
+    $matching = @($desktops | Where-Object {
+      $_.target.kind -eq $target.kind -and $_.target.value -eq $target.value
+    })
+    if ($matching.Count -eq 0) { throw 'Recovery target was not captured' }
+    # Partial close or an unrelated caller exit must never launch another copy
+    # while any of this installation's captured desktop roots remain alive.
+    $exitDeadline = [DateTime]::UtcNow.AddSeconds(5)
+    while (@($matching | Where-Object { $null -ne $_.process -and -not $_.process.HasExited }).Count -gt 0 -and
+           [DateTime]::UtcNow -lt $exitDeadline) { Start-Sleep -Milliseconds 100 }
+    if (@($matching | Where-Object { $null -ne $_.process -and -not $_.process.HasExited }).Count -gt 0) { continue }
+    if ($target.kind -eq 'app') {
+      if ($target.value -notmatch '^OpenAI\.Codex[A-Za-z0-9._-]*_2p2nqsd0c76g0![A-Za-z0-9._-]+$') {
+        throw 'Invalid Codex application identity'
+      }
+      Start-Process -FilePath ('shell:AppsFolder\' + $target.value)
+    } elseif ($target.kind -eq 'exe') {
+      Start-Process -FilePath $target.value -WorkingDirectory ([IO.Path]::GetDirectoryName($target.value))
+    } else { throw 'Unsupported recovery target' }
+    $launched[$key] = $true
+  }
+  Write-Result 'launched' '' # Backend separately confirms the exact desktop.
+} catch { Write-Result 'failed' $_.Exception.Message; exit 1 }
+"#;
 
 static PENDING_REOPEN: Mutex<Option<ReopenTicket>> = Mutex::new(None);
 
@@ -224,6 +498,7 @@ fn closed_targets(desktops: Vec<CapturedDesktop>, killed_pids: &[u32]) -> Vec<De
 pub(super) fn remember_closed_desktops(
     desktops: Vec<CapturedDesktop>,
     killed_pids: &[u32],
+    recovery: Option<Recovery>,
 ) -> Option<String> {
     let targets = closed_targets(desktops, killed_pids);
     let mut pending = PENDING_REOPEN.lock().ok()?;
@@ -236,34 +511,44 @@ pub(super) fn remember_closed_desktops(
         token: token.clone(),
         created_at: Instant::now(),
         targets,
+        recovery,
     });
     Some(token)
 }
 
-fn take_targets(
-    pending: &mut Option<ReopenTicket>,
-    token: &str,
-) -> Result<Vec<DesktopTarget>, String> {
+fn take_targets(pending: &mut Option<ReopenTicket>, token: &str) -> Result<ReopenTicket, String> {
     let valid = pending.as_ref().is_some_and(|ticket| {
         ticket.token == token && ticket.created_at.elapsed() < Duration::from_secs(120)
     });
     if !valid {
         return Err("The desktop reopen request expired or is no longer available".into());
     }
-    Ok(pending.take().expect("validated ticket").targets)
+    Ok(pending.take().expect("validated ticket"))
 }
 
 #[tauri::command]
 pub async fn reopen_closed_codex_desktop(token: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        let targets = take_targets(
+        // Keep the ticket available when another live session still blocks it.
+        super::ensure_codex_not_running()?;
+        let mut ticket = take_targets(
             &mut *PENDING_REOPEN.lock().map_err(|e| e.to_string())?,
             &token,
         )?;
-        super::ensure_codex_not_running()?;
-        let expected = targets.clone();
-        for target in &targets {
-            if !launch_desktop(target) {
+        let expected = ticket.targets.clone();
+        #[cfg(windows)]
+        if let Some(recovery) = ticket.recovery.as_mut() {
+            // The frontend/backend calls this only after the account write (or
+            // its failure). Never race a still-running credential update.
+            crate::auth::persistence::atomic_write(
+                &recovery.directory.join("reopen.json"),
+                &serde_json::to_vec(&ticket.targets.iter().map(recovery_target).collect::<Vec<_>>())
+                    .map_err(|e| e.to_string())?,
+            ).map_err(|e| e.to_string())?;
+            recovery.cancel_on_drop = false;
+        }
+        for target in &ticket.targets {
+            if ticket.recovery.is_none() && !launch_desktop(target) {
                 return Err("Could not launch Codex desktop. The account change was not undone. Open Codex manually.".into());
             }
         }
@@ -333,6 +618,28 @@ fn launch_desktop(target: &DesktopTarget) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn dropping_recovery_only_cancels_before_close_started() {
+        for close_started in [false, true] {
+            let directory = std::env::temp_dir()
+                .join(format!("switcher-recovery-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).unwrap();
+            let mut recovery = Recovery {
+                directory: directory.clone(),
+                cancel_on_drop: true,
+                helper: None,
+            };
+            if close_started {
+                recovery.close_started();
+            }
+            drop(recovery);
+            assert_eq!(directory.join("cancel").exists(), !close_started);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+        assert!(prepare_recovery(&[]).unwrap().is_none());
+    }
 
     #[test]
     fn launch_confirmation_requires_the_exact_desktop_and_handles_detection_failure() {
@@ -475,14 +782,16 @@ mod tests {
             targets: vec![DesktopTarget::WindowsAppId(
                 "OpenAI.Codex_2p2nqsd0c76g0!App".into(),
             )],
+            recovery: None,
         });
         assert!(take_targets(&mut ticket, "wrong").is_err());
-        assert_eq!(take_targets(&mut ticket, "token").unwrap().len(), 1);
+        assert_eq!(take_targets(&mut ticket, "token").unwrap().targets.len(), 1);
         assert!(take_targets(&mut ticket, "token").is_err());
         let mut expired = Some(ReopenTicket {
             token: "expired".into(),
             created_at: Instant::now() - Duration::from_secs(121),
             targets: vec![DesktopTarget::WindowsExecutable("C:\\Codex.exe".into())],
+            recovery: None,
         });
         assert!(take_targets(&mut expired, "expired").is_err());
     }

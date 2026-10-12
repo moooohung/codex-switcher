@@ -1,4 +1,5 @@
 //! Window and tray popup management commands.
+use tauri::Emitter;
 
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -8,8 +9,8 @@ use std::{
 use tauri::{AppHandle, Manager, Runtime};
 
 use crate::{
-    auth::{load_app_settings, save_app_settings},
-    types::{DockDisplayMode, TrayDisplayMode, UsageInfo},
+    auth::{load_app_settings, update_app_settings},
+    types::{DockDisplayMode, PlanPreference, TrayDisplayMode, UsageInfo},
 };
 
 /// Label of the borderless tray popup window.
@@ -25,8 +26,7 @@ pub struct CloseBehaviorRequestedPayload {
     pub request_id: u64,
 }
 
-/// Receive the main app's polled usage so the tray menu can show remaining quota
-/// without doing its own fetching. The main window is the single usage poller.
+/// Share fresh UI usage with the tray and the automatic rotation monitor.
 #[tauri::command]
 pub fn report_usage(app: AppHandle, usages: Vec<UsageInfo>) {
     #[cfg(desktop)]
@@ -83,14 +83,31 @@ pub fn schedule_close_behavior_prompt_fallback<R: Runtime>(app: AppHandle<R>, re
 
 /// Bring the main window to the foreground and hide the tray popup.
 pub fn restore_main_window<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(tray) = app.get_webview_window(TRAY_WINDOW) {
-        let _ = tray.hide();
-    }
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-    }
+    let app_handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(tray) = app_handle.get_webview_window(TRAY_WINDOW) {
+            let _ = tray.hide();
+        }
+        if let Some(window) = app_handle.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+            #[cfg(target_os = "windows")]
+            {
+                if let Ok(hwnd) = window.hwnd() {
+                    use windows_sys::Win32::UI::WindowsAndMessaging::{
+                        BringWindowToTop, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+                    };
+                    unsafe {
+                        ShowWindow(hwnd.0 as _, SW_RESTORE);
+                        ShowWindow(hwnd.0 as _, SW_SHOW);
+                        BringWindowToTop(hwnd.0 as _);
+                        SetForegroundWindow(hwnd.0 as _);
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Quit the whole application from the tray.
@@ -103,6 +120,9 @@ pub fn quit_app(app: AppHandle) {
 pub struct DisplaySettings {
     tray_display_mode: TrayDisplayMode,
     dock_display_mode: Option<DockDisplayMode>,
+    auto_switch_enabled: bool,
+    auto_switch_threshold_percent: f64,
+    auto_switch_plan_preference: PlanPreference,
 }
 
 #[tauri::command]
@@ -115,7 +135,47 @@ pub fn get_display_settings() -> Result<DisplaySettings, String> {
         } else {
             None
         },
+        auto_switch_enabled: settings.auto_switch_enabled,
+        auto_switch_threshold_percent: settings.auto_switch_threshold_percent,
+        auto_switch_plan_preference: settings.auto_switch_plan_preference,
     })
+}
+
+#[tauri::command]
+pub fn get_auto_switch_status() -> Result<crate::auto_switch::AutoSwitchStatus, String> {
+    #[cfg(desktop)]
+    {
+        crate::tray::auto_switch_status()
+    }
+    #[cfg(not(desktop))]
+    {
+        Err("Automatic rotation requires the desktop monitor".into())
+    }
+}
+
+#[tauri::command]
+pub fn set_auto_switch_settings(
+    app: AppHandle,
+    enabled: bool,
+    threshold_percent: f64,
+    plan_preference: Option<PlanPreference>,
+) -> Result<(), String> {
+    if !threshold_percent.is_finite() {
+        return Err("Invalid threshold".into());
+    }
+    update_app_settings(|settings| {
+        settings.auto_switch_enabled = enabled;
+        settings.auto_switch_threshold_percent = threshold_percent.clamp(50.0, 99.0);
+        if let Some(preference) = plan_preference {
+            settings.auto_switch_plan_preference = preference;
+        }
+        Ok(())
+    })
+    .map_err(|error| error.to_string())?;
+    let _ = app.emit("app-settings-changed", ());
+    #[cfg(desktop)]
+    crate::tray::request_auto_switch_check(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -176,8 +236,11 @@ pub fn complete_close_behavior(
         let mut settings = crate::app_menu::set_dock_display_mode(&app, mode)
             .map_err(|error| error.to_string())?;
         if dont_ask_again {
-            settings.close_behavior_prompt_enabled = false;
-            save_app_settings(&settings).map_err(|error| error.to_string())?;
+            update_app_settings(|current| {
+                current.close_behavior_prompt_enabled = false;
+                Ok(())
+            })
+            .map_err(|error| error.to_string())?;
         }
         hide_main_window(&app);
         Ok(Some(settings.dock_display_mode))
