@@ -120,6 +120,7 @@ function publisherFixture(t, options = {}) {
     draft: options.published !== true, assets: [],
   };
   const calls = [];
+  let created = false;
   const notFound = () => { throw Object.assign(new Error("Not Found"), { stderr: "gh: Not Found (HTTP 404)" }); };
   const fakeGh = (command, args) => {
     assert.equal(command, "gh");
@@ -131,13 +132,23 @@ function publisherFixture(t, options = {}) {
       if (route.includes("/releases/tags/")) return notFound();
       if (route.includes("/actions/workflows/")) return JSON.stringify({ workflow_runs: [{ ...trusted, head_sha: options.ciSha ?? sha }] });
       if (route.includes("/git/ref/tags/")) return JSON.stringify({ object: { type: "commit", sha: options.tagSha ?? sha } });
+      if (route === `repos/${REPOSITORY}/releases`) {
+        assert.equal(release, null, "An existing draft must be reused");
+        assert(args.includes("POST") && args.includes("draft=true") && args.includes("prerelease=true"));
+        assert(args.includes(`tag_name=${plan.tag}`) && args.includes(`target_commitish=${sha}`));
+        release = { id: 410176291, tag_name: plan.tag, target_commitish: sha, draft: true, assets: [] };
+        created = true;
+        return JSON.stringify(options.createResponse ? options.createResponse(structuredClone(release)) : release);
+      }
       if (route === `repos/${REPOSITORY}/releases?per_page=100`) {
         assert.deepEqual(args.slice(2), ["--paginate", "--slurp"]);
         if (options.listError) throw options.listError;
-        return JSON.stringify([[{ id: 1, tag_name: "unrelated", draft: false }], release ? [release] : []]);
+        return JSON.stringify([[{ id: 1, tag_name: "unrelated", draft: false }], release && !(created && options.hideCreated) ? [release] : []]);
       }
       if (route === `repos/${REPOSITORY}/releases/410176291`) {
-        assert(calls.some((call) => call[0] === "release" && call[1] === "upload"));
+        if (!calls.some((call) => call[0] === "release" && call[1] === "upload")) {
+          return JSON.stringify(options.beforeUpload ? options.beforeUpload(structuredClone(release)) : release);
+        }
         return JSON.stringify(options.readback ? options.readback(structuredClone(release)) : release);
       }
     } else if (args[0] === "attestation") {
@@ -147,14 +158,6 @@ function publisherFixture(t, options = {}) {
       return "verified";
     } else if (args[0] === "release") {
       assert.equal(args[2], plan.tag);
-      if (args[1] === "create") {
-        assert.equal(release, null, "An existing draft must be reused");
-        assert.equal(args[args.indexOf("--target") + 1], sha);
-        assert(args.includes("--draft"));
-        assert(args.includes("--prerelease"));
-        release = { id: 410176291, tag_name: plan.tag, target_commitish: sha, draft: true, assets: [] };
-        return "created";
-      }
       if (args[1] === "upload") {
         assert.equal(release.draft, true);
         release.assets = args.slice(3, args.indexOf("--repo")).map((file) => ({
@@ -176,13 +179,13 @@ function publisherFixture(t, options = {}) {
 
 for (const existing of [false, true]) {
   test(`publisher ${existing ? "resumes" : "creates"} a draft hidden from the tag endpoint and verifies assets by ID`, (t) => {
-    const fixture = publisherFixture(t, { existing });
+    const fixture = publisherFixture(t, { existing, hideCreated: true });
     assert.throws(() => fixture.fakeGh("gh", ["api", `repos/${REPOSITORY}/releases/tags/${fixture.args.tag}`]), /Not Found/);
     fixture.calls.length = 0;
     assert.equal(publishRelease(fixture.args, fixture.fakeGh), 410176291);
     assert.equal(fixture.getRelease().draft, false);
     assert.equal(fixture.getRelease().assets.length, 9); // Four bundles, four manifests and checksums.
-    assert.equal(fixture.calls.filter((call) => call[0] === "release" && call[1] === "create").length, existing ? 0 : 1);
+    assert.equal(fixture.calls.filter((call) => call[0] === "api" && call[1] === `repos/${REPOSITORY}/releases`).length, existing ? 0 : 1);
     assert.equal(fixture.calls.filter((call) => call[0] === "attestation").length, 8);
     assert(!fixture.calls.some((call) => call[1]?.includes("/releases/tags/")));
     const upload = fixture.calls.findIndex((call) => call[0] === "release" && call[1] === "upload");
@@ -233,3 +236,21 @@ test("publisher retains trusted CI, source, tag and attestation gates", async (t
     assert(!fixture.calls.some((call) => call[0] === "release"));
   });
 });
+
+for (const stage of ["createResponse", "beforeUpload"]) {
+  test(`publisher rejects invalid ${stage} identity before uploading`, async (t) => {
+    const cases = [
+      ["ID", (r) => ({ ...r, id: stage === "createResponse" ? 0 : 2 })],
+      ["draft", (r) => ({ ...r, draft: false })],
+      ["tag", (r) => ({ ...r, tag_name: "v9.9.9" })],
+      ["source", (r) => ({ ...r, target_commitish: "0".repeat(40) })],
+    ];
+    if (stage === "createResponse") cases.push(["fractional ID", (r) => ({ ...r, id: 1.5 })], ["missing response", () => null]);
+    for (const [name, mutate] of cases) await t.test(name, (t) => {
+      const fixture = publisherFixture(t, { existing: false, hideCreated: true, [stage]: mutate });
+      assert.throws(() => publishRelease(fixture.args, fixture.fakeGh), assert.AssertionError);
+      assert(!fixture.calls.some((call) => call[0] === "release"));
+      assert.equal(fixture.getRelease().draft, true);
+    });
+  });
+}

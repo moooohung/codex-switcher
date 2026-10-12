@@ -174,15 +174,21 @@ export function publishRelease({ repository, sha, tag, version, prerelease, root
   if (!release) {
     const notesFile = path.join(root, "release-notes.md");
     fs.writeFileSync(notesFile, `Source: ${sha}\n\nAll four platform bundles passed. SHA-256 checksums and GitHub build attestations are included. OS certificate signing/notarization is not configured.\n`);
-    const args = ["release", "create", tag, "--repo", REPOSITORY, "--target", sha, "--title", tag, "--draft", "--notes-file", notesFile];
-    if (prerelease) args.push("--prerelease");
-    execute("gh", args);
-    release = findRelease(tag, execute);
+    // Use the create response: authenticated listings can lag behind creation.
+    release = JSON.parse(execute("gh", ["api", `repos/${REPOSITORY}/releases`, "--method", "POST",
+      "-f", `tag_name=${tag}`, "-f", `target_commitish=${sha}`, "-f", `name=${tag}`,
+      "-F", "draft=true", "-F", `prerelease=${prerelease}`, "-f", `body=${fs.readFileSync(notesFile, "utf8")}`]));
   }
-  assert(release?.draft, "Created release is not an authenticated draft");
+  assert.equal(release?.draft, true, "Created release is not an authenticated draft");
   assert(Number.isSafeInteger(release.id) && release.id > 0, "Invalid draft release ID");
+  assert.equal(release.tag_name, tag, "Draft release belongs to another tag");
   assert.equal(release.target_commitish, sha, "Draft release belongs to another source commit");
   const releaseId = release.id;
+  const draft = api(`repos/${REPOSITORY}/releases/${releaseId}`, execute);
+  assert.equal(draft.id, releaseId, "Draft release ID changed before upload");
+  assert.equal(draft.draft, true, "Release was published before upload");
+  assert.equal(draft.tag_name, tag, "Draft release tag changed before upload");
+  assert.equal(draft.target_commitish, sha, "Draft release source changed before upload");
   checkTag(plan, execute);
   execute("gh", ["release", "upload", tag, ...files, checksumFile, "--repo", REPOSITORY, "--clobber"]);
   release = api(`repos/${REPOSITORY}/releases/${releaseId}`, execute);
