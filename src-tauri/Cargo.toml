@@ -31,7 +31,7 @@ webbrowser = "1"
 base64 = "=0.23.1"
 # pbkdf2 0.12's backup KDF requires digest 0.10; sha2 0.11 uses digest 0.11.
 sha2 = "=0.10.9"
-rand = "0.9"
+rand = "0.10"
 thiserror = "2"
 anyhow = "=1.0.104"
 urlencoding = "2"
