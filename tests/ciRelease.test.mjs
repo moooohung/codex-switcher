@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { REPOSITORY, TARGETS, releasePlan, versionEdits, collectReleaseFiles } from "../scripts/ci-release.mjs";
+import { REPOSITORY, TARGETS, releasePlan, wixVersion, versionEdits, collectReleaseFiles } from "../scripts/ci-release.mjs";
 
 const sha = "abcdef1234567890abcdef1234567890abcdef12";
 const trusted = { name: "CI", event: "push", conclusion: "success", head_branch: "main", head_sha: sha, head_repository: { full_name: REPOSITORY } };
@@ -45,10 +45,25 @@ test("all version documents are validated before any file is mutated", () => {
     const edits = versionEdits(root, releasePlan(input).version);
     assert.equal(edits.size, 4);
     for (const [file, text] of originals) assert.equal(fs.readFileSync(path.join(root, file), "utf8"), text);
+    const installer = versionEdits(root, releasePlan(input).version, 42);
+    const config = JSON.parse(installer.get("src-tauri/tauri.conf.json"));
+    assert.equal(config.version, releasePlan(input).version);
+    assert.equal(config.bundle.windows.wix.version, "0.2.21.42");
     fs.writeFileSync(path.join(root, "src-tauri/Cargo.lock"), '[[package]]\nname = "unrelated"\nversion = "0.2.21"\n');
     assert.throws(() => versionEdits(root, "0.2.21"), /lock version drift/);
     assert.equal(fs.readFileSync(path.join(root, "package.json"), "utf8"), originals.get("package.json"));
   } finally { fs.rmSync(root, { recursive: true }); }
+});
+
+test("MSI preview versions are numeric, bounded and sort below the matching stable build", () => {
+  assert.equal(wixVersion(releasePlan(input).version, 1), "0.2.21.1");
+  assert.equal(wixVersion(releasePlan(input).version, 65534), "0.2.21.65534");
+  assert.equal(wixVersion("0.2.21", 42), "0.2.21.65535");
+  for (const run of [undefined, 0, -1, 65535, "NaN", 1.5]) {
+    assert.throws(() => wixVersion(releasePlan(input).version, run));
+  }
+  assert.throws(() => wixVersion("256.0.1", 1), /WiX limits/);
+  assert.throws(() => wixVersion("0.2.65536", 1), /WiX limits/);
 });
 
 test("publication requires complete platform manifests matching the same source and version", () => {

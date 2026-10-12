@@ -48,7 +48,19 @@ export function releasePlan({ repository, eventName, event, sha, version, reques
   return { sha, version: buildVersion, tag: `v${buildVersion}`, prerelease: !requestedTag };
 }
 
-export function versionEdits(root, version) {
+export function wixVersion(version, runNumber) {
+  const match = version.match(/^(\d+)\.(\d+)\.(\d+)(-ci\.g[a-f0-9]{12})?$/);
+  assert(match, "Invalid installer source version");
+  const parts = match.slice(1, 4).map(Number);
+  assert(parts[0] <= 255 && parts[1] <= 255 && parts[2] <= 65535, "MSI version component exceeds WiX limits");
+  // Stable builds sort above previews of the same application version.
+  // Reject counter overflow rather than silently reuse an installer version.
+  const build = match[4] ? Number(runNumber) : 65535;
+  assert(Number.isInteger(build) && build >= 1 && build <= (match[4] ? 65534 : 65535), "MSI preview requires a run number between 1 and 65534");
+  return [...parts, build].join(".");
+}
+
+export function versionEdits(root, version, runNumber) {
   const files = ["package.json", "src-tauri/tauri.conf.json", "src-tauri/Cargo.toml", "src-tauri/Cargo.lock"];
   const texts = files.map((file) => fs.readFileSync(path.join(root, file), "utf8"));
   const old = JSON.parse(texts[0]).version;
@@ -59,12 +71,21 @@ export function versionEdits(root, version) {
   assert.equal(texts[2].match(cargo)?.[2], old, "Cargo version drift");
   assert.equal(texts[3].match(lock)?.[2], old, "Cargo lock version drift");
   assert.match(version, /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-ci\.g[a-f0-9]{12})?$/);
-  return new Map([
+  const edits = new Map([
     [files[0], texts[0].replace(/"version"\s*:\s*"[^"\r\n]+"/, `"version": "${version}"`)],
     [files[1], texts[1].replace(/"version"\s*:\s*"[^"\r\n]+"/, `"version": "${version}"`)],
     [files[2], texts[2].replace(cargo, (_, before, _old, after) => before + version + after)],
     [files[3], texts[3].replace(lock, (_, before, _old, after) => before + version + after)],
   ]);
+  if (runNumber !== undefined) {
+    const config = JSON.parse(edits.get(files[1]));
+    config.bundle ??= {};
+    config.bundle.windows ??= {};
+    config.bundle.windows.wix ??= {};
+    config.bundle.windows.wix.version = wixVersion(version, runNumber);
+    edits.set(files[1], JSON.stringify(config, null, 2) + "\n");
+  }
+  return edits;
 }
 
 export function collectReleaseFiles(root, plan) {
@@ -131,14 +152,14 @@ function main(command) {
     const version = JSON.parse(fs.readFileSync("package.json", "utf8")).version;
     const plan = releasePlan({ repository: process.env.GITHUB_REPOSITORY, eventName: process.env.GITHUB_EVENT_NAME, event, sha, version, requestedTag: process.env.REQUESTED_TAG, workflowSha: process.env.GITHUB_SHA });
     if (!plan) return output({ ready: false });
-    versionEdits(root, plan.version); // Check all four files before any build mutation.
+    versionEdits(root, plan.version, process.env.GITHUB_RUN_NUMBER); // Check all files before any build mutation.
     requireCI(sha);
     checkTag(plan);
     const existing = optionalApi(`repos/${REPOSITORY}/releases/tags/${plan.tag}`);
     if (existing && !existing.draft) return output({ ready: false });
     output({ ready: true, ...plan });
   } else if (command === "apply") {
-    const edits = versionEdits(root, process.env.BUILD_VERSION);
+    const edits = versionEdits(root, process.env.BUILD_VERSION, process.env.GITHUB_RUN_NUMBER);
     for (const [file, text] of edits) fs.writeFileSync(path.join(root, file), text);
   } else if (command === "stage") {
     const target = process.env.BUILD_TARGET;

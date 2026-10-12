@@ -224,6 +224,9 @@ Pull request CI never triggers a release. Superseded commits are skipped when
 their source digest differs from the release workflow's signed digest. Stable
 tags must match `package.json`, Tauri, Cargo and the lockfile. Builds use a
 temporary preview version without changing source history.
+MSI bundles use a separate numeric WiX version: previews use the workflow run
+number (1–65534), and stable builds use 65535 so they upgrade previews of the
+same app version. An overflowing counter fails before packaging.
 
 Maintainers can run `Build & Release` on main after CI passes; leave `version`
 empty for a preview or enter the exact matching stable tag. Completed tags are
