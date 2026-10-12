@@ -2025,10 +2025,11 @@ mod tests {
     }
 
     fn resume_fixture() -> ResumeTarget {
+        let root = PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" });
         ResumeTarget {
             session_id: "01a11d1e-5b36-72b2-b20a-4df7db240797".into(),
-            transcript: PathBuf::from(r"C:\Native history\rollout.jsonl"),
-            cwd: PathBuf::from(r"C:\Saved workspace\project with spaces"),
+            transcript: root.join("Native history").join("rollout.jsonl"),
+            cwd: root.join("Saved workspace").join("project with spaces"),
             model: Some("gpt-5.6-sol".into()),
             effort: Some("xhigh".into()),
         }
@@ -2062,7 +2063,7 @@ mod tests {
             &args[base.len()..],
             &[
                 "--cd",
-                r"C:\Saved workspace\project with spaces",
+                target.cwd.to_str().unwrap(),
                 "--model",
                 "gpt-5.6-sol",
                 "-c",
@@ -2144,10 +2145,11 @@ mod tests {
             target.effort = Some(effort.into());
             assert!(launch_arguments(&endpoint, Some(&target)).is_err());
         }
+        let valid_cwd = resume_fixture().cwd.to_string_lossy().into_owned();
         for cwd in [
-            "relative workspace",
-            "C:\\Saved workspace\0",
-            "C:\\Saved workspace\n",
+            "relative workspace".to_owned(),
+            format!("{valid_cwd}\0"),
+            format!("{valid_cwd}\n"),
         ] {
             let mut target = resume_fixture();
             target.cwd = PathBuf::from(cwd);
