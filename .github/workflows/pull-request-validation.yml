@@ -93,7 +93,10 @@ jobs:
           fi
 
       - name: Run Rust tests
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+        # Auth fixtures change process-wide home variables and inspect global
+        # operation locks. Serialize the harness; individual concurrency tests
+        # still create their own competing threads/processes.
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml -- --test-threads=1
 
   platform-check:
     name: Platform compile (${{ matrix.os }})
