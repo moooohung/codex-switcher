@@ -4,11 +4,23 @@ updates:
     directory: /src-tauri
     schedule:
       interval: daily
+    open-pull-requests-limit: 10
+    groups:
+      cargo-compatible:
+        update-types: [minor, patch]
   - package-ecosystem: npm
     directory: /
     schedule:
       interval: daily
+    open-pull-requests-limit: 10
+    groups:
+      npm-compatible:
+        update-types: [minor, patch]
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: daily
+    open-pull-requests-limit: 5
+    groups:
+      action-updates:
+        patterns: ['*']

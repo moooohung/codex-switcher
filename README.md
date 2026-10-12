@@ -10,7 +10,10 @@ It adds an independent Claude Code provider with profile-scoped quota polling, a
 
 Inactive accounts use their own saved OAuth credentials for quota polling. Cache preferences can be saved before a session is connected. Missing quota windows remain unknown; stale or revoked credentials do not become spare quota. A revoked refresh token still requires official sign-in. Settings, runtime registration, a confirmed connection and measured cache hits are displayed separately.
 
-The fork disables the upstream in-app updater so an upstream package cannot replace these changes. Releases are available from this fork after a tagged build; a new source commit does not imply that a release artifact or every platform has been verified. Dependency update automation remains enabled.
+The fork disables the upstream in-app updater so an upstream package cannot replace these changes. Passing main commits produce versioned preview releases; stable releases require a matching version tag. A source commit does not imply that a release has passed its publication checks. Dependency update automation remains enabled.
+
+[![CI](https://github.com/moooohung/codex-switcher/actions/workflows/pull-request-validation.yml/badge.svg)](https://github.com/moooohung/codex-switcher/actions/workflows/pull-request-validation.yml)
+[![Build & Release](https://github.com/moooohung/codex-switcher/actions/workflows/build.yml/badge.svg)](https://github.com/moooohung/codex-switcher/actions/workflows/build.yml)
 
 <p align="center">
   A Desktop Application for Managing Multiple OpenAI <a href="https://github.com/openai/codex">Codex</a> Accounts<br>
@@ -41,19 +44,25 @@ The fork disables the upstream in-app updater so an upstream package cannot repl
 
 ### Download a Release
 
-The fork currently publishes source. Build from source until its first tagged
-binary release is available. Tagged builds will publish platform packages here:
+Completed builds publish platform packages here. Main previews have a
+`v<version>-ci.g<commit>` tag; stable releases use `v<version>`. If the required
+checks or any platform build fails, no partial release is published:
 
 [Fork releases](https://github.com/moooohung/codex-switcher/releases)
 
-When a tagged release is available, choose the file for your platform:
+Choose the filename prefix for your platform:
 
-- **macOS Apple Silicon:** `Codex.Switcher_*_aarch64.dmg`
-- **macOS Intel:** `Codex.Switcher_*_x64.dmg`
-- **Windows:** `Codex.Switcher_*_x64-setup.exe` or `Codex.Switcher_*_x64_en-US.msi`
-- **Linux Debian/Ubuntu:** `Codex.Switcher_*_amd64.deb`
-- **Linux AppImage:** `Codex.Switcher_*_amd64.AppImage`
-- **Linux RPM:** `Codex.Switcher-*-1.x86_64.rpm`
+- **macOS Apple Silicon:** `aarch64-apple-darwin--*.dmg`
+- **macOS Intel:** `x86_64-apple-darwin--*.dmg`
+- **Windows:** `x86_64-pc-windows-msvc--*.exe` or `*.msi`
+- **Linux:** `x86_64-unknown-linux-gnu--*.deb`, `*.AppImage` or `*.rpm`
+
+Each release includes SHA-256 checksums and per-platform provenance manifests.
+Verify a downloaded package's GitHub build attestation with:
+
+```bash
+gh attestation verify <package> --repo moooohung/codex-switcher
+```
 
 > **macOS:** current release builds are not Apple-notarized. If macOS says the
 > app is damaged, move it to `/Applications` and remove the quarantine flag:
@@ -199,6 +208,30 @@ This tool is designed **exclusively for individuals who personally own multiple 
 - Any form of account pooling or credential sharing
 
 By using this software, you agree that you are the rightful owner of all accounts you add to the application. The authors are not responsible for any misuse or violations of OpenAI's terms of service.
+
+## GitHub Actions
+
+The required `CI gate` aggregates frontend tests/build, serialized Rust tests on
+Linux, Windows and macOS, workflow lint, CodeQL for TypeScript/JavaScript, Rust
+and Actions, and dependency review on pull requests. It also runs weekly and
+supports merge queues. Focused Linux startup and updater workflows are retained.
+Dependabot checks npm, Cargo and action updates daily.
+
+A successful main **push** CI starts a four-target build. Publication requires
+successful CI for that exact commit, synchronized source versions, all four
+platform bundles, verified attestations and uploaded asset digest readback.
+Pull request CI never triggers a release. Superseded commits are skipped when
+their source digest differs from the release workflow's signed digest. Stable
+tags must match `package.json`, Tauri, Cargo and the lockfile. Builds use a
+temporary preview version without changing source history.
+
+Maintainers can run `Build & Release` on main after CI passes; leave `version`
+empty for a preview or enter the exact matching stable tag. Completed tags are
+idempotent; failed draft publications can be retried. Workflow tokens default
+to read access, and only the final publisher receives release write access.
+Actions are pinned to full commit SHAs. Cache and job time limits bound wasted
+runs. Standard GitHub-hosted runners and public-repository security features
+are used; no paid AI action, larger runner or signing service is required.
 
 ## Versioning
 

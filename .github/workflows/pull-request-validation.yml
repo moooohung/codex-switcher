@@ -1,10 +1,13 @@
-name: Pull Request Validation
+name: CI
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
   pull_request:
+  merge_group:
+  schedule:
+    - cron: '23 4 * * 1'
 
 concurrency:
   group: validation-${{ github.workflow }}-${{ github.ref }}
@@ -17,20 +20,24 @@ jobs:
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v7.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: "26.11.1"
-          package-manager-cache: false
+          persist-credentials: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6.1.0
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: "12.11.2"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26.11.1"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
@@ -43,10 +50,12 @@ jobs:
 
   rust:
     name: Rust tests and format
+    # Preserve the upstream minimum Linux/WebKit ABI for distributable binaries.
     runs-on: ubuntu-22.04
+    timeout-minutes: 35
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -57,20 +66,27 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable-20261009
         with:
           components: rustfmt
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v7.1.0
-        with:
-          node-version: "26.11.1"
-          package-manager-cache: false
-
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6.1.0
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: "12.11.2"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26.11.1"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri -> target
+          save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
 
       - name: Build embedded frontend
         run: |
@@ -99,34 +115,126 @@ jobs:
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml -- --test-threads=1
 
   platform-check:
-    name: Platform compile (${{ matrix.os }})
+    name: Platform tests (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v7.1.0
-        with:
-          node-version: "26.11.1"
-          package-manager-cache: false
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable-20261009
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6.1.0
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: "12.11.2"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26.11.1"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri -> target
+          save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
 
       - name: Build embedded frontend
         run: |
           pnpm install --frozen-lockfile
           pnpm build
 
-      - name: Compile platform-specific Rust
-        run: cargo check --locked --manifest-path src-tauri/Cargo.toml
+      - name: Run native platform offline tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml -- --test-threads=1
+
+  workflow-lint:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check workflows with verified actionlint
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          stage="$RUNNER_TEMP/actionlint"
+          mkdir -p "$stage"
+          gh release download v1.7.12 --repo rhysd/actionlint --dir "$stage"             --pattern actionlint_1.7.12_linux_amd64.tar.gz --pattern actionlint_1.7.12_checksums.txt
+          (cd "$stage" && sha256sum --check --ignore-missing actionlint_1.7.12_checksums.txt)
+          tar -xzf "$stage/actionlint_1.7.12_linux_amd64.tar.gz" -C "$stage"
+          "$stage/actionlint" -color .github/workflows/*.yml
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: never
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript, rust, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+      - name: Analyze
+        uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          category: '/language:${{ matrix.language }}'
+
+  ci-gate:
+    name: CI gate
+    if: always()
+    needs: [frontend, rust, platform-check, workflow-lint, dependency-review, codeql]
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Require all applicable checks
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python - <<'PY'
+          import json, os
+          for name, check in json.loads(os.environ['RESULTS']).items():
+              optional = name == 'dependency-review' and os.environ['EVENT_NAME'] != 'pull_request'
+              assert check['result'] == ('skipped' if optional else 'success'), name + ': ' + check['result']
+          PY
