@@ -41,11 +41,12 @@ The fork disables the upstream in-app updater so an upstream package cannot repl
 
 ### Download a Release
 
-The easiest way to install Codex Switcher is from the latest GitHub release:
+The fork currently publishes source. Build from source until its first tagged
+binary release is available. Tagged builds will publish platform packages here:
 
-[Download the latest fork release](https://github.com/moooohung/codex-switcher/releases/latest)
+[Fork releases](https://github.com/moooohung/codex-switcher/releases)
 
-Choose the file for your platform:
+When a tagged release is available, choose the file for your platform:
 
 - **macOS Apple Silicon:** `Codex.Switcher_*_aarch64.dmg`
 - **macOS Intel:** `Codex.Switcher_*_x64.dmg`
@@ -71,17 +72,17 @@ until the fork has its own verified signing and update infrastructure.
 
 #### Prerequisites
 
-- [Node.js](https://nodejs.org/) (v18+)
-- [pnpm](https://pnpm.io/)
-- [Rust](https://rustup.rs/)
+- [Node.js](https://nodejs.org/) (26.11.1, matching the fork's CI)
+- [pnpm](https://pnpm.io/) (12.11.2, matching the fork's CI)
+- [Rust](https://rustup.rs/) (stable)
 
 ```bash
 # Clone the repository
-git clone https://github.com/Lampese/codex-switcher.git
+git clone https://github.com/moooohung/codex-switcher.git
 cd codex-switcher
 
 # Install dependencies
-pnpm install
+pnpm install --frozen-lockfile
 
 # Run in development mode
 pnpm tauri dev
