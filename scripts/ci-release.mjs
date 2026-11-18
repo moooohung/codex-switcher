@@ -48,7 +48,19 @@ export function releasePlan({ repository, eventName, event, sha, version, reques
   return { sha, version: buildVersion, tag: `v${buildVersion}`, prerelease: !requestedTag };
 }
 
-export function versionEdits(root, version) {
+export function wixVersion(version, runNumber) {
+  const match = version.match(/^(\d+)\.(\d+)\.(\d+)(-ci\.g[a-f0-9]{12})?$/);
+  assert(match, "Invalid installer source version");
+  const parts = match.slice(1, 4).map(Number);
+  assert(parts[0] <= 255 && parts[1] <= 255 && parts[2] <= 65535, "MSI version component exceeds WiX limits");
+  // Stable builds sort above previews of the same application version.
+  // Reject counter overflow rather than silently reuse an installer version.
+  const build = match[4] ? Number(runNumber) : 65535;
+  assert(Number.isInteger(build) && build >= 1 && build <= (match[4] ? 65534 : 65535), "MSI preview requires a run number between 1 and 65534");
+  return [...parts, build].join(".");
+}
+
+export function versionEdits(root, version, runNumber) {
   const files = ["package.json", "src-tauri/tauri.conf.json", "src-tauri/Cargo.toml", "src-tauri/Cargo.lock"];
   const texts = files.map((file) => fs.readFileSync(path.join(root, file), "utf8"));
   const old = JSON.parse(texts[0]).version;
@@ -59,12 +71,35 @@ export function versionEdits(root, version) {
   assert.equal(texts[2].match(cargo)?.[2], old, "Cargo version drift");
   assert.equal(texts[3].match(lock)?.[2], old, "Cargo lock version drift");
   assert.match(version, /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-ci\.g[a-f0-9]{12})?$/);
-  return new Map([
+  const edits = new Map([
     [files[0], texts[0].replace(/"version"\s*:\s*"[^"\r\n]+"/, `"version": "${version}"`)],
     [files[1], texts[1].replace(/"version"\s*:\s*"[^"\r\n]+"/, `"version": "${version}"`)],
     [files[2], texts[2].replace(cargo, (_, before, _old, after) => before + version + after)],
     [files[3], texts[3].replace(lock, (_, before, _old, after) => before + version + after)],
   ]);
+  if (runNumber !== undefined) {
+    const config = JSON.parse(edits.get(files[1]));
+    config.bundle ??= {};
+    config.bundle.windows ??= {};
+    config.bundle.windows.wix ??= {};
+    config.bundle.windows.wix.version = wixVersion(version, runNumber);
+    edits.set(files[1], JSON.stringify(config, null, 2) + "\n");
+  }
+  return edits;
+}
+
+// GitHub may rename unsafe upload names; choose names before provenance and
+// attestation are generated instead of trusting a server-side rename mapping.
+// https://docs.github.com/en/rest/releases/assets#upload-a-release-asset
+export function uploadNames(names) {
+  const normalized = names.map((name) => {
+    assert.equal(path.basename(name), name, "Upload name must be a basename");
+    const safe = name.replace(/ /g, "-");
+    assert.match(safe, /^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$/, "Unsafe upload filename");
+    return safe;
+  });
+  assert.equal(new Set(normalized.map((name) => name.toLowerCase())).size, normalized.length, "Upload filename collision");
+  return normalized;
 }
 
 export function collectReleaseFiles(root, plan) {
@@ -102,25 +137,90 @@ export function collectReleaseFiles(root, plan) {
 }
 
 const run = (command, args) => execFileSync(command, args, { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] }).trim();
-const api = (route) => JSON.parse(run("gh", ["api", route]));
-function optionalApi(route) {
-  try { return api(route); } catch (error) {
+const api = (route, execute = run) => JSON.parse(execute("gh", ["api", route]));
+function optionalApi(route, execute = run) {
+  try { return api(route, execute); } catch (error) {
     if (String(error.stderr).includes("HTTP 404")) return null;
     throw error;
   }
 }
-function checkTag(plan) {
-  let object = optionalApi(`repos/${REPOSITORY}/git/ref/tags/${plan.tag}`)?.object;
-  for (let count = 0; object?.type === "tag" && count < 4; count++) object = api(`repos/${REPOSITORY}/git/tags/${object.sha}`).object;
+function checkTag(plan, execute = run) {
+  let object = optionalApi(`repos/${REPOSITORY}/git/ref/tags/${plan.tag}`, execute)?.object;
+  for (let count = 0; object?.type === "tag" && count < 4; count++) object = api(`repos/${REPOSITORY}/git/tags/${object.sha}`, execute).object;
   if (object) assert(object.type === "commit" && object.sha === plan.sha, "Existing tag belongs to another source commit");
 }
-function requireCI(sha) {
-  const runs = api(`repos/${REPOSITORY}/actions/workflows/pull-request-validation.yml/runs?head_sha=${sha}&status=success&per_page=100`).workflow_runs;
+function requireCI(sha, execute = run) {
+  const runs = api(`repos/${REPOSITORY}/actions/workflows/pull-request-validation.yml/runs?head_sha=${sha}&status=success&per_page=100`, execute).workflow_runs;
   assert(runs.some((r) => r.head_sha === sha && r.head_branch === "main" &&
     r.head_repository?.full_name === REPOSITORY && ["push", "workflow_dispatch"].includes(r.event)), "This exact source has no successful trusted main CI run");
 }
 function output(values) {
   fs.appendFileSync(process.env.GITHUB_OUTPUT, Object.entries(values).map(([k, v]) => `${k}=${v}\n`).join(""));
+}
+
+export function findRelease(tag, execute = run) {
+  // The tag endpoint may return 404 for a draft. Authenticated release listings
+  // include writable drafts; paginate so retrying an older draft finds its ID.
+  const pages = JSON.parse(execute("gh", ["api", `repos/${REPOSITORY}/releases?per_page=100`, "--paginate", "--slurp"]));
+  const matches = pages.flat().filter((release) => release.tag_name === tag);
+  assert(matches.length <= 1, "Multiple releases have the same tag");
+  return matches[0] ?? null;
+}
+
+export function publishRelease({ repository, sha, tag, version, prerelease, root = process.cwd() }, execute = run) {
+  const plan = { sha, tag, version };
+  assert.equal(repository, REPOSITORY);
+  assert.match(sha, SHA);
+  assert.match(tag, /^v\d+\.\d+\.\d+(-ci\.g[a-f0-9]{12})?$/);
+  assert.equal(tag, `v${version}`, "Release tag and build version must agree");
+  assert.equal(typeof prerelease, "boolean");
+  requireCI(sha, execute);
+  checkTag(plan, execute);
+  const files = collectReleaseFiles(path.join(root, "release-assets"), plan);
+  assert.deepEqual(uploadNames(files.map((file) => path.basename(file))), files.map((file) => path.basename(file)),
+    "Release filenames must be normalized before attestation");
+  // Verify provenance before publication, including the exact source digest.
+  for (const file of files) execute("gh", ["attestation", "verify", file, "--repo", REPOSITORY, "--source-digest", sha, "--signer-workflow", `${REPOSITORY}/.github/workflows/build.yml`, "--deny-self-hosted-runners"]);
+  const digests = new Map(files.map((file) => [path.basename(file), createHash("sha256").update(readRegularFile(file)).digest("hex")]));
+  const checksumFile = path.join(root, "release-assets/checksums.txt");
+  fs.writeFileSync(checksumFile, [...digests].map(([name, digest]) => `${digest}  ${name}\n`).join(""));
+  digests.set("checksums.txt", createHash("sha256").update(fs.readFileSync(checksumFile)).digest("hex"));
+  let release = findRelease(tag, execute);
+  if (release && !release.draft) return;
+  if (!release) {
+    const notesFile = path.join(root, "release-notes.md");
+    fs.writeFileSync(notesFile, `Source: ${sha}\n\nAll four platform bundles passed. SHA-256 checksums and GitHub build attestations are included. OS certificate signing/notarization is not configured.\n`);
+    // Use the create response: authenticated listings can lag behind creation.
+    release = JSON.parse(execute("gh", ["api", `repos/${REPOSITORY}/releases`, "--method", "POST",
+      "-f", `tag_name=${tag}`, "-f", `target_commitish=${sha}`, "-f", `name=${tag}`,
+      "-F", "draft=true", "-F", `prerelease=${prerelease}`, "-f", `body=${fs.readFileSync(notesFile, "utf8")}`]));
+  }
+  assert.equal(release?.draft, true, "Created release is not an authenticated draft");
+  assert(Number.isSafeInteger(release.id) && release.id > 0, "Invalid draft release ID");
+  assert.equal(release.tag_name, tag, "Draft release belongs to another tag");
+  assert.equal(release.target_commitish, sha, "Draft release belongs to another source commit");
+  const releaseId = release.id;
+  const draft = api(`repos/${REPOSITORY}/releases/${releaseId}`, execute);
+  assert.equal(draft.id, releaseId, "Draft release ID changed before upload");
+  assert.equal(draft.draft, true, "Release was published before upload");
+  assert.equal(draft.tag_name, tag, "Draft release tag changed before upload");
+  assert.equal(draft.target_commitish, sha, "Draft release source changed before upload");
+  checkTag(plan, execute);
+  execute("gh", ["release", "upload", tag, ...files, checksumFile, "--repo", REPOSITORY, "--clobber"]);
+  release = api(`repos/${REPOSITORY}/releases/${releaseId}`, execute);
+  assert.equal(release.id, releaseId, "Release ID changed during upload");
+  assert.equal(release.tag_name, tag, "Release tag changed during upload");
+  assert.equal(release.target_commitish, sha, "Release source changed during upload");
+  assert.equal(release.draft, true, "Release was published before asset verification");
+  assert.equal(release.assets.length, digests.size, "Unexpected or missing published assets");
+  assert.equal(new Set(release.assets.map((asset) => asset.name)).size, digests.size, "Duplicate uploaded asset names");
+  for (const asset of release.assets) {
+    assert(digests.has(asset.name), "Unexpected uploaded asset name");
+    assert.equal(asset.digest, `sha256:${digests.get(asset.name)}`, "Uploaded asset digest mismatch");
+  }
+  checkTag(plan, execute);
+  execute("gh", ["release", "edit", tag, "--repo", REPOSITORY, "--draft=false", `--prerelease=${prerelease}`, `--latest=${!prerelease}`]);
+  return releaseId;
 }
 
 function main(command) {
@@ -131,14 +231,14 @@ function main(command) {
     const version = JSON.parse(fs.readFileSync("package.json", "utf8")).version;
     const plan = releasePlan({ repository: process.env.GITHUB_REPOSITORY, eventName: process.env.GITHUB_EVENT_NAME, event, sha, version, requestedTag: process.env.REQUESTED_TAG, workflowSha: process.env.GITHUB_SHA });
     if (!plan) return output({ ready: false });
-    versionEdits(root, plan.version); // Check all four files before any build mutation.
+    versionEdits(root, plan.version, process.env.GITHUB_RUN_NUMBER); // Check all files before any build mutation.
     requireCI(sha);
     checkTag(plan);
-    const existing = optionalApi(`repos/${REPOSITORY}/releases/tags/${plan.tag}`);
+    const existing = findRelease(plan.tag);
     if (existing && !existing.draft) return output({ ready: false });
     output({ ready: true, ...plan });
   } else if (command === "apply") {
-    const edits = versionEdits(root, process.env.BUILD_VERSION);
+    const edits = versionEdits(root, process.env.BUILD_VERSION, process.env.GITHUB_RUN_NUMBER);
     for (const [file, text] of edits) fs.writeFileSync(path.join(root, file), text);
   } else if (command === "stage") {
     const target = process.env.BUILD_TARGET;
@@ -147,10 +247,11 @@ function main(command) {
     assert(Array.isArray(paths));
     fs.mkdirSync("release-assets", { recursive: true });
     const files = [];
-    for (const source of paths) {
-      if (!PACKAGE.test(source)) continue;
+    const packages = paths.filter((source) => PACKAGE.test(source));
+    const names = uploadNames(packages.map((source) => `${target}--${path.basename(source)}`));
+    for (const [index, source] of packages.entries()) {
       const bytes = readRegularFile(source);
-      const name = `${target}--${path.basename(source)}`;
+      const name = names[index];
       assert(!/[\r\n\0]/.test(name));
       const destination = path.join("release-assets", name);
       fs.writeFileSync(destination, bytes, { flag: "wx" });
@@ -159,34 +260,8 @@ function main(command) {
     assert(files.length > 0, "Tauri produced no distributable packages");
     fs.writeFileSync(`release-assets/provenance-${target}.json`, JSON.stringify({ target, sha: process.env.SOURCE_SHA, tag: process.env.RELEASE_TAG, version: process.env.BUILD_VERSION, files }, null, 2) + "\n");
   } else if (command === "publish") {
-    const plan = { sha: process.env.SOURCE_SHA, tag: process.env.RELEASE_TAG, version: process.env.BUILD_VERSION };
-    assert.equal(process.env.GITHUB_REPOSITORY, REPOSITORY);
-    assert.match(plan.sha, SHA);
-    assert.match(plan.tag, /^v\d+\.\d+\.\d+(-ci\.g[a-f0-9]{12})?$/);
-    requireCI(plan.sha);
-    checkTag(plan);
-    const files = collectReleaseFiles("release-assets", plan);
-    // Verify provenance before publication, including the exact source digest.
-    for (const file of files) run("gh", ["attestation", "verify", file, "--repo", REPOSITORY, "--source-digest", plan.sha, "--signer-workflow", `${REPOSITORY}/.github/workflows/build.yml`, "--deny-self-hosted-runners"]);
-    const digests = new Map(files.map((file) => [path.basename(file), createHash("sha256").update(readRegularFile(file)).digest("hex")]));
-    const checksumFile = "release-assets/checksums.txt";
-    fs.writeFileSync(checksumFile, [...digests].map(([name, digest]) => `${digest}  ${name}\n`).join(""));
-    digests.set("checksums.txt", createHash("sha256").update(fs.readFileSync(checksumFile)).digest("hex"));
-    const existing = optionalApi(`repos/${REPOSITORY}/releases/tags/${plan.tag}`);
-    if (existing && !existing.draft) return;
-    if (!existing) {
-      fs.writeFileSync("release-notes.md", `Source: ${plan.sha}\n\nAll four platform bundles passed. SHA-256 checksums and GitHub build attestations are included. OS certificate signing/notarization is not configured.\n`);
-      const args = ["release", "create", plan.tag, "--repo", REPOSITORY, "--target", plan.sha, "--title", plan.tag, "--draft", "--notes-file", "release-notes.md"];
-      if (process.env.PRERELEASE === "true") args.push("--prerelease");
-      run("gh", args);
-    }
-    checkTag(plan);
-    run("gh", ["release", "upload", plan.tag, ...files, checksumFile, "--repo", REPOSITORY, "--clobber"]);
-    const release = api(`repos/${REPOSITORY}/releases/tags/${plan.tag}`);
-    assert.equal(release.assets.length, digests.size, "Unexpected or missing published assets");
-    for (const asset of release.assets) assert.equal(asset.digest, `sha256:${digests.get(asset.name)}`, "Uploaded asset digest mismatch");
-    run("gh", ["release", "edit", plan.tag, "--repo", REPOSITORY, "--draft=false", `--prerelease=${process.env.PRERELEASE}`, `--latest=${process.env.PRERELEASE !== "true"}`]);
-    console.log(`Published ${plan.tag} from ${plan.sha}`);
+    const releaseId = publishRelease({ repository: process.env.GITHUB_REPOSITORY, sha: process.env.SOURCE_SHA, tag: process.env.RELEASE_TAG, version: process.env.BUILD_VERSION, prerelease: process.env.PRERELEASE === "true" });
+    if (releaseId) console.log(`Published ${process.env.RELEASE_TAG} from ${process.env.SOURCE_SHA}`);
   } else throw new Error("Expected plan, apply, stage or publish");
 }
 

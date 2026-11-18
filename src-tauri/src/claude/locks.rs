@@ -673,8 +673,22 @@ mod tests {
         let path = temp.0.join("wait.lock");
         let holder = DirectoryGuard::acquire(&path, timing()).unwrap();
         let waiter_path = path.clone();
-        let waiter = thread::spawn(move || DirectoryGuard::acquire(&waiter_path, timing()));
+        let (started, ready) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            started.send(()).unwrap();
+            DirectoryGuard::acquire(
+                &waiter_path,
+                Timing {
+                    timeout: Duration::from_secs(2),
+                    // Successful waiting must depend on release, not expiry.
+                    stale: Duration::from_secs(5),
+                    ..timing()
+                },
+            )
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
         thread::sleep(Duration::from_millis(60));
+        assert!(holder.directory.still_owned().unwrap());
         drop(holder);
         let next = waiter.join().unwrap().unwrap();
         assert!(next.directory.still_owned().unwrap());
