@@ -1,4 +1,4 @@
-use rand::RngCore;
+use rand::Rng;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};

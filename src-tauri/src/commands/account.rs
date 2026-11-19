@@ -19,7 +19,7 @@ use chacha20poly1305::{
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use futures::{stream, StreamExt};
 use pbkdf2::pbkdf2_hmac;
-use rand::RngCore;
+use rand::Rng;
 use sha2::Sha256;
 use std::collections::HashSet;
 use std::fs;
